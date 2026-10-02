@@ -29,7 +29,7 @@ def inputs(tmp_path, monkeypatch):
     source = [{"prompt": p} for p in
               ["train", " RAW   TRAIN ", "projector", "ＫＬ", "", None,
                "Held out one", "held  OUT one", "Held out two"]]
-    monkeypatch.setattr(prep, "load_any_dataset", lambda *args: source)
+    monkeypatch.setattr(prep, "load_source", lambda *args: source)
     return dict(task_file=task, exclude_prompts=[projector, monitor],
                 output=tmp_path / "eval" / "evaluation.parquet", count=2)
 
@@ -39,12 +39,13 @@ def test_automatic_holdout_is_disjoint_deterministic_and_reused(inputs, monkeypa
     rows = prep.read_rows(output)
     assert {prep.prompt_key(r["prompt"]) for r in rows} == {
         prep.prompt_key("held out one"), prep.prompt_key("held out two")}
-    assert all(r["source_split"] == "train" and r["sampling_seed"] == 66 for r in rows)
+    assert all(r["source_split"] == "test" and r["sampling_seed"] == 66 for r in rows)
+    assert {r["source_revision"] for r in rows} == {prep.PKU_SAFERLHF_REVISION}
     copy = output.with_name("second.parquet")
     prep.prepare_evaluation(**dict(inputs, output=copy))
     assert prep.read_rows(copy) == rows
     before = output.read_bytes()
-    monkeypatch.setattr(prep, "load_any_dataset", lambda *args: pytest.fail("Reuse must not download"))
+    monkeypatch.setattr(prep, "load_source", lambda *args: pytest.fail("Reuse must not download"))
     prep.prepare_evaluation(**inputs)
     assert output.read_bytes() == before
 
@@ -77,9 +78,9 @@ def test_colab_prepares_evaluation_before_gpu_generation(tmp_path):
     config = cells["small-06"].replace(
         "Path('/content/drive/MyDrive/GRIT_colab_0p5b')", f"Path({str(tmp_path)!r})"
     ).replace("HUB_REPO_ID = ''", "HUB_REPO_ID = 'test/repo'")
-    # Configuration must work before any dataset exists; keep test secrets local.
+    # Configuration points at the checked-in test split; keep test secrets local.
     exec(config, context)
-    assert not context["EVALUATION_FILE"].exists()
+    assert context["EVALUATION_FILE"].is_file()
     commands = []
 
     def run(command, **kwargs):
@@ -89,8 +90,7 @@ def test_colab_prepares_evaluation_before_gpu_generation(tmp_path):
             context["TASK_FILE"].touch()
         elif "scripts/prepare_evaluation_data.py" in command:
             assert commands[-2][-1] == "sample"
-            context["EVALUATION_FILE"].parent.mkdir(parents=True, exist_ok=True)
-            context["EVALUATION_FILE"].touch()
+            assert context["EVALUATION_FILE"].is_file()
         elif command[-1] in ("generate", "build"):
             assert context["EVALUATION_FILE"].is_file()
             for key in ("preserve_file", "projectors_path"):

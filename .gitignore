@@ -24,5 +24,6 @@ wandb/
 *.safetensors
 *.ckpt
 *.parquet
+!data/evaluation/pku_saferlhf_test_1000.parquet
 *.log
 eval_benchmarks/configs/models.local.json

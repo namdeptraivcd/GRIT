@@ -33,7 +33,7 @@ def parse_args(argv=None):
     parser.add_argument("--model-revision", default=LARGE.policy_revision)
     parser.add_argument("--task-file", required=True)
     parser.add_argument("--preserve-file", help="Disjoint KL monitoring contexts; required unless --lambda-pres 0")
-    parser.add_argument("--evaluation-file", help="Prompt corpus reserved for evaluation and disjointness checks")
+    parser.add_argument("--evaluation-file", help="Held-out prompt corpus for periodic safety validation")
     parser.add_argument("--projectors-path", required=True)
     parser.add_argument("--projector-relaxation", type=float, default=0.05,
                         help="Pass-through outside null space: 0=hard NSPO, 1=no projection")
@@ -73,6 +73,8 @@ def parse_args(argv=None):
     parser.add_argument("--safety-attempts", type=int, default=3)
     parser.add_argument("--reward-batch-size", type=int, default=4)
     parser.add_argument("--safety-max-new-tokens", type=int, default=128)
+    parser.add_argument("--validation-steps", type=int, default=2,
+                        help="Run greedy safety validation every N committed updates; 0 disables")
     parser.add_argument("--gradient-checkpointing", action="store_true")
     parser.add_argument("--max-steps", type=int, default=40)
     parser.add_argument("--save-steps", type=int, default=100)
@@ -88,16 +90,16 @@ def parse_args(argv=None):
             parser.error(f"--{key.replace('_', '-')} must be positive")
     if args.generations < 2 or args.lr <= 0 or args.adam_eps <= 0 or args.fd_radius <= 0:
         parser.error("Need generations >= 2 and positive lr, adam-eps, fd-radius")
-    if args.fd_check_interval < 0 or args.gradient_topk < 0:
-        parser.error("--fd-check-interval and --gradient-topk must be nonnegative")
+    if args.fd_check_interval < 0 or args.gradient_topk < 0 or args.validation_steps < 0:
+        parser.error("--fd-check-interval, --gradient-topk and --validation-steps must be nonnegative")
     if args.lambda_pres < 0 or args.weight_decay < 0 or not 0 < args.clip_ratio < 1:
         parser.error("Invalid loss/optimizer coefficients")
     if not 0 <= args.projector_relaxation <= 1:
         parser.error("--projector-relaxation must be in [0, 1]")
     if args.lambda_pres and not args.preserve_file:
         parser.error("--preserve-file is required when --lambda-pres > 0")
-    if args.lambda_pres and not args.evaluation_file:
-        parser.error("--evaluation-file is required to prove preservation/evaluation disjointness")
+    if (args.lambda_pres or args.validation_steps) and not args.evaluation_file:
+        parser.error("--evaluation-file is required for safety validation and preservation disjointness")
     if args.task_optimizer == "sgd" and args.weight_decay:
         parser.error("The original proposal (--task-optimizer sgd) has no weight decay")
     if args.top_k != 64:
@@ -300,6 +302,104 @@ def base_kl_at_current_policy(model, tokenizer, rows, *, max_length, top_k, devi
     return float(sums[0]/sums[1].clamp_min(1)), float(maximum)
 
 
+@torch.no_grad()
+def run_safety_validation(*, rollout, model, tokenizer, safety, safety_tokenizer,
+                          evaluation, args, rank, world, device, step):
+    """Generate one greedy response per held-out prompt and score all responses."""
+    started = time.monotonic()
+    prompts = [str(value).strip() for value in evaluation["prompt"]]
+    if not prompts or any(not prompt for prompt in prompts):
+        raise ValueError("Safety evaluation requires nonempty prompt values")
+
+    def generate():
+        prompt_ids = [
+            tokenizer.apply_chat_template(
+                [{"role": "user", "content": prompt}], tokenize=True,
+                add_generation_prompt=True,
+            )[-args.max_prompt_length:]
+            for prompt in prompts
+        ]
+        if rollout.version != step:
+            rollout.sync(model, step)
+        return rollout.generate(
+            prompt_ids, version=step, n=1, max_tokens=args.max_response_length,
+            temperature=0.0, top_p=1.0, seed=args.seed,
+        )
+
+    groups = broadcast_call(rank, generate)
+    if len(groups) != len(prompts) or any(len(group) != 1 for group in groups):
+        raise RuntimeError("Safety validation rollout count mismatch")
+    responses = [group[0] for group in groups]
+    count, offset = distributed_slice(len(prompts), rank, world)
+    local_prompts = prompts[offset:offset+count]
+    local_responses = responses[offset:offset+count]
+    response_texts = tokenizer.batch_decode(
+        [response["token_ids"] for response in local_responses], skip_special_tokens=True,
+    )
+
+    rewards = torch.empty(0, device=device, dtype=torch.float32)
+    labels = []
+    parse_errors = retries = 0.0
+    safety.to(device)
+    try:
+        reward_parts = []
+        for index in range(0, count, args.reward_batch_size):
+            part, part_labels, diagnostics = score_safety_rewards(
+                safety, safety_tokenizer,
+                local_prompts[index:index+args.reward_batch_size],
+                response_texts[index:index+args.reward_batch_size],
+                max_length=args.max_prompt_length+args.max_response_length+512,
+                max_new_tokens=args.safety_max_new_tokens, device=device,
+                attempts=args.safety_attempts,
+            )
+            reward_parts.append(part)
+            labels.extend(part_labels)
+            parse_errors += diagnostics["parse_errors"]
+            retries += diagnostics["retries"]
+        if reward_parts:
+            rewards = torch.cat(reward_parts)
+    finally:
+        safety.to("cpu")
+        torch.cuda.empty_cache()
+
+    totals = torch.tensor([
+        float(rewards.sum()), float(rewards.square().sum()), rewards.numel(),
+        int((rewards < 0).sum()), parse_errors, retries,
+        sum(len(response["token_ids"]) for response in local_responses),
+    ], device=device, dtype=torch.float64)
+    elapsed = torch.tensor(time.monotonic()-started, device=device, dtype=torch.float64)
+    if world > 1:
+        dist.all_reduce(totals, op=dist.ReduceOp.SUM)
+        dist.all_reduce(elapsed, op=dist.ReduceOp.MAX)
+    total_count = totals[2].clamp_min(1)
+    reward_mean = totals[0]/total_count
+    metrics = {
+        "validation_ran": True,
+        "validation_count": int(totals[2]),
+        "validation_reward_mean": float(reward_mean),
+        "validation_reward_std": float((totals[1]/total_count-reward_mean.square()).clamp_min(0).sqrt()),
+        "validation_unsafe_fraction": float(totals[3]/total_count),
+        "validation_parse_errors": int(totals[4]),
+        "validation_retries": int(totals[5]),
+        "validation_response_tokens": int(totals[6]),
+        "validation_seconds": float(elapsed),
+    }
+    local_records = [
+        {"step": step, "index": offset+index, "prompt": prompt, "response": response,
+         "reward": float(reward), "safety_label": label}
+        for index, (prompt, response, reward, label) in enumerate(zip(
+            local_prompts, response_texts, rewards.cpu().tolist(), labels, strict=True
+        ))
+    ]
+    gathered = [None]*world
+    if world > 1:
+        dist.all_gather_object(gathered, local_records)
+    else:
+        gathered[0] = local_records
+    records = [record for part in gathered for record in part] if rank == 0 else None
+    return metrics, records
+
+
 def validate_gpu_layout(*, visible: list[str], rollout_gpu: str, world: int, colocated: bool) -> None:
     if not visible or not visible[0]:
         raise ValueError("Set CUDA_VISIBLE_DEVICES to actor GPUs")
@@ -344,7 +444,8 @@ def train(args):
         if not (resume / "complete.json").exists():
             raise ValueError("Checkpoint missing completion marker")
         checkpoint = torch.load(resume / "training.pt", map_location="cpu", weights_only=False)
-        allowed_changes = {"resume", "max_steps", "save_steps", "output_dir", "rollout_gpu", "rollout_timeout"}
+        allowed_changes = {"resume", "max_steps", "save_steps", "validation_steps",
+                           "output_dir", "rollout_gpu", "rollout_timeout"}
         changed = [key for key, value in vars(args).items()
                    if key not in allowed_changes and checkpoint["args"].get(key) != value]
         if checkpoint["world_size"] != world or changed:
@@ -406,7 +507,12 @@ def train(args):
             projectors[name] = projectors[name].to(device=device, dtype=torch.float32)
     task = load_dataset("parquet", data_files=args.task_file, split="train")
     preserve = load_dataset("parquet", data_files=args.preserve_file, split="train") if args.lambda_pres else None
-    evaluation = load_dataset("parquet", data_files=args.evaluation_file, split="train") if args.lambda_pres else None
+    evaluation = load_dataset("parquet", data_files=args.evaluation_file, split="train") if args.evaluation_file else None
+    if evaluation is not None:
+        if "prompt" not in evaluation.column_names or not len(evaluation):
+            raise ValueError("Safety evaluation file needs a nonempty prompt column")
+        if any(not isinstance(prompt, str) or not prompt.strip() for prompt in evaluation["prompt"]):
+            raise ValueError("Safety evaluation prompts must be nonempty strings")
     if preserve is not None:
         from scripts.preservation_data import validate_monitoring_split
         validate_monitoring_split(payload, preserve, evaluation)
@@ -466,7 +572,8 @@ def train(args):
             else:
                 all_ids[0] = prompt_ids
             def generate():
-                rollout.sync(model, step-1)
+                if rollout.version != step-1:
+                    rollout.sync(model, step-1)
                 return rollout.generate([ids for group in all_ids for ids in group], version=step-1,
                                         n=args.generations, max_tokens=args.max_response_length,
                                         temperature=1.0, top_p=1.0, seed=args.seed+step)
@@ -702,6 +809,30 @@ def train(args):
             task_sampler.advance(args.task_batch_size)
             if pres_sampler is not None:
                 pres_sampler.advance(args.preserve_batch_size)
+            metrics.update(
+                validation_ran=False, validation_count=0,
+                validation_reward_mean=None, validation_reward_std=None,
+                validation_unsafe_fraction=None, validation_parse_errors=0,
+                validation_retries=0, validation_response_tokens=0,
+                validation_seconds=0.0,
+            )
+            if args.validation_steps and step % args.validation_steps == 0:
+                validation_metrics, validation_records = run_safety_validation(
+                    rollout=rollout, model=model, tokenizer=tokenizer,
+                    safety=safety, safety_tokenizer=safety_tokenizer,
+                    evaluation=evaluation, args=args, rank=rank, world=world,
+                    device=device, step=step,
+                )
+                metrics.update(validation_metrics)
+                if rank == 0:
+                    validation_dir = output / "validation"
+                    validation_dir.mkdir(exist_ok=True)
+                    destination = validation_dir / f"step_{step:06d}.jsonl"
+                    temporary = destination.with_suffix(".jsonl.tmp")
+                    with temporary.open("w", encoding="utf-8") as handle:
+                        for record in validation_records:
+                            handle.write(json.dumps(record, ensure_ascii=False)+"\n")
+                    temporary.replace(destination)
             checkpoint_tick = time.monotonic()
             hub_push_error = None
             if step % args.save_steps == 0 or step == args.max_steps:

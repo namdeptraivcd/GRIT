@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reserve unused task-source prompts for Colab evaluation overlap checks."""
+"""Build and verify a pinned PKU-SafeRLHF test set for safety validation."""
 
 from __future__ import annotations
 
@@ -13,9 +13,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.prepare_grit_data import (
-    PROMPT_ASSISTANT, PROMPT_BEGIN, PROMPT_USER, load_any_dataset,
-)
+from scripts.prepare_grit_data import PROMPT_ASSISTANT, PROMPT_BEGIN, PROMPT_USER
 from scripts.prepare_preservation_data import read_rows
 from scripts.preservation_data import preservation_prompt_hashes, prompt_key
 
@@ -37,13 +35,25 @@ def row_keys(row: dict) -> set[str]:
     }
 
 
-def prepare_evaluation(*, task_file: Path, exclude_prompts: list[Path], output: Path,
+PKU_SAFERLHF_REVISION = "9421ffafec3fa40a1f1a7d567b4d525079477ecb"
+
+
+def load_source(dataset: str, split: str, revision: str):
+    from datasets import load_dataset
+
+    return load_dataset(dataset, split=split, revision=revision)
+
+
+def prepare_evaluation(*, output: Path, task_file: Path | None = None,
+                       exclude_prompts: list[Path] | None = None,
                        dataset: str = "PKU-Alignment/PKU-SafeRLHF",
-                       split: str = "train", count: int = 1000, seed: int = 66) -> Path:
+                       revision: str = PKU_SAFERLHF_REVISION,
+                       split: str = "test", count: int = 1000, seed: int = 66) -> Path:
     if count <= 0:
         raise ValueError("Evaluation count must be positive")
     blocked = set()
-    for path in [task_file, *exclude_prompts]:
+    exclusion_paths = ([task_file] if task_file is not None else []) + list(exclude_prompts or [])
+    for path in exclusion_paths:
         rows = read_rows(path)
         if not rows:
             raise ValueError(f"Empty exclusion corpus: {path}")
@@ -57,7 +67,15 @@ def prepare_evaluation(*, task_file: Path, exclude_prompts: list[Path], output: 
         rows = read_rows(output)
         if not rows:
             raise ValueError(f"Empty evaluation file: {output}")
+        if len(rows) != count:
+            raise ValueError(f"Expected {count} evaluation prompts, found {len(rows)}: {output}")
         preservation_prompt_hashes(rows)
+        if {row.get("data_source") for row in rows} != {dataset}:
+            raise ValueError(f"Evaluation source mismatch: {output}")
+        if {row.get("source_revision") for row in rows} != {revision}:
+            raise ValueError(f"Evaluation revision mismatch: {output}")
+        if {row.get("source_split") for row in rows} != {split}:
+            raise ValueError(f"Evaluation split mismatch: {output}")
         seen = set(blocked)
         for row in rows:
             keys = row_keys(row)
@@ -68,7 +86,7 @@ def prepare_evaluation(*, task_file: Path, exclude_prompts: list[Path], output: 
         return output
 
     print(f"Preparing {count} held-out evaluation prompts from {dataset}/{split}", flush=True)
-    source = load_any_dataset(dataset, split)
+    source = load_source(dataset, split, revision)
     indices = list(range(len(source)))
     random.Random(seed).shuffle(indices)
     selected = []
@@ -85,7 +103,8 @@ def prepare_evaluation(*, task_file: Path, exclude_prompts: list[Path], output: 
             continue
         blocked.update(keys)
         selected.append({"prompt": prompt, "prompt_sha256": prompt_key(prompt),
-                         "data_source": dataset, "source_split": split,
+                         "data_source": dataset, "source_revision": revision,
+                         "source_split": split,
                          "source_row": index, "sampling_seed": seed})
         if len(selected) == count:
             break
@@ -107,11 +126,13 @@ def prepare_evaluation(*, task_file: Path, exclude_prompts: list[Path], output: 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--task-file", type=Path, required=True)
-    parser.add_argument("--exclude-prompts", type=Path, nargs="+", required=True)
-    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--task-file", type=Path)
+    parser.add_argument("--exclude-prompts", type=Path, nargs="*", default=[])
+    parser.add_argument("--output", type=Path,
+                        default=REPO_ROOT / "data/evaluation/pku_saferlhf_test_1000.parquet")
     parser.add_argument("--dataset", default="PKU-Alignment/PKU-SafeRLHF")
-    parser.add_argument("--split", default="train")
+    parser.add_argument("--revision", default=PKU_SAFERLHF_REVISION)
+    parser.add_argument("--split", default="test")
     parser.add_argument("--count", type=int, default=1000)
     parser.add_argument("--seed", type=int, default=66)
     prepare_evaluation(**vars(parser.parse_args()))

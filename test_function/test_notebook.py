@@ -44,7 +44,8 @@ def test_colab_small_notebook_keeps_full_grit_workflow():
             assert cell["outputs"] == [] and cell["execution_count"] is None
     for required in ("SMALL.policy", "SMALL.safety", "allow_colocated_rollout", "rollout_memory_utilization",
                      "run_preservation_projectors.sh", "task_batch_size': 321", "preserve_batch_size': 48",
-                     "top_k': 64", "use_curvature': True", "--resume", "complete.json"):
+                     "top_k': 64", "use_curvature': True", "validation_steps': 2",
+                     "pku_saferlhf_test_1000.parquet", "--resume", "complete.json"):
         assert required in source
 
 

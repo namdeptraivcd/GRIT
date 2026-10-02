@@ -13,7 +13,7 @@ from grit.diagnostics import step_alerts, summarize_metrics
 from grit.rollout import VLLMRollout, _worker, load_policy_weights
 from grit.step import accumulate, grit_step
 from scripts.train_grit import (EpochSampler, base_kl_at_current_policy, distributed_slice,
-                                parse_args, push_checkpoint, validate_gpu_layout,
+                                parse_args, push_checkpoint, run_safety_validation, validate_gpu_layout,
                                 validate_hub_access)
 
 
@@ -364,6 +364,57 @@ def test_rollout_controller_rejects_stale_version():
         rollout.generate([[1]], version=3)
 
 
+def test_safety_validation_scores_updated_policy_and_records_every_prompt(monkeypatch):
+    class Rollout:
+        version = 1
+        def __init__(self):
+            self.synced = []
+            self.sampling = None
+        def sync(self, model, version):
+            self.synced.append(version)
+            self.version = version
+        def generate(self, prompt_ids, **sampling):
+            self.sampling = sampling
+            return [[{"token_ids": [index+1], "log_probs": [0.0]}]
+                    for index in range(len(prompt_ids))]
+
+    class Tokenizer:
+        def apply_chat_template(self, messages, **kwargs):
+            return [0, len(messages[0]["content"])]
+        def batch_decode(self, token_ids, **kwargs):
+            return [f"response-{ids[0]}" for ids in token_ids]
+
+    class Safety:
+        def __init__(self):
+            self.moves = []
+        def to(self, device):
+            self.moves.append(str(device))
+            return self
+
+    def score(model, tokenizer, prompts, responses, **kwargs):
+        values = [-1.0 if prompt == "unsafe" else 0.0 for prompt in prompts]
+        labels = ["Safety: Unsafe" if value < 0 else "Safety: Safe" for value in values]
+        return torch.tensor(values), labels, {"parse_errors": 0.0, "retries": 0.0}
+
+    monkeypatch.setattr("scripts.train_grit.score_safety_rewards", score)
+    rollout, safety = Rollout(), Safety()
+    args = SimpleNamespace(max_prompt_length=16, max_response_length=8, seed=66,
+                           reward_batch_size=2, safety_max_new_tokens=4, safety_attempts=3)
+    metrics, records = run_safety_validation(
+        rollout=rollout, model=object(), tokenizer=Tokenizer(), safety=safety,
+        safety_tokenizer=object(), evaluation={"prompt": ["safe one", "unsafe", "safe two"]},
+        args=args, rank=0, world=1, device=torch.device("cpu"), step=2,
+    )
+    assert rollout.synced == [2]
+    assert rollout.sampling["version"] == 2
+    assert rollout.sampling["n"] == 1 and rollout.sampling["temperature"] == 0.0
+    assert metrics["validation_count"] == 3
+    assert metrics["validation_unsafe_fraction"] == pytest.approx(1/3)
+    assert metrics["validation_reward_mean"] == pytest.approx(-1/3)
+    assert [record["index"] for record in records] == [0, 1, 2]
+    assert safety.moves[-1] == "cpu"
+
+
 def test_cli_requires_preservation_and_supports_projection_only():
     base = ["--task-file", "task.parquet", "--projectors-path", "p.pt", "--rollout-gpu", "3",
             "--evaluation-file", "eval.parquet"]
@@ -371,9 +422,13 @@ def test_cli_requires_preservation_and_supports_projection_only():
         parse_args(base)
     args = parse_args(base+["--lambda-pres", "0"])
     assert args.generations == 5 and args.task_optimizer == "adamw"
+    assert args.validation_steps == 2
     assert args.base_statistics_dtype == "float16"
     assert args.projector_relaxation == 0.05
     assert parse_args(base+["--lambda-pres", "0", "--projector-relaxation", "0"]).projector_relaxation == 0
+    assert parse_args(base+["--lambda-pres", "0", "--validation-steps", "0"]).validation_steps == 0
+    with pytest.raises(SystemExit):
+        parse_args(base+["--lambda-pres", "0", "--validation-steps", "-1"])
     with pytest.raises(SystemExit):
         parse_args(base+["--lambda-pres", "0", "--projector-relaxation", "1.1"])
     with pytest.raises(SystemExit):

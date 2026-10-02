@@ -51,23 +51,21 @@ Colab run.
 Task prompts -> current-policy vLLM rollout -> frozen rewards/advantages
 Projector prompts (1,000) -> frozen-base responses -> compact projectors
 KL prompts (6,000) -> frozen-base responses + stored base top-64 statistics
-Reserved evaluation prompts -> overlap check only
+PKU-SafeRLHF test prompts (1,000) -> greedy rollout + safety score every 2 steps
 GRIT update -> local checkpoint -> best-effort private Hub upload + metrics
 ```
 
 The projector set contains 334 general, 333 math, and 333 code prompts. The KL
 set contains 2,000 prompts from each domain. Sampling uses the pinned revisions
 in `config/preservation/`, hashes normalized prompts, and rejects overlap between
-the two sets. Training also requires a separate `--evaluation-file` and rejects
-normalized prompt overlap with either preservation set. The evaluation file must
-contain a nonempty `prompt` column. In the Colab notebook it is prepared
-automatically by `scripts/prepare_evaluation_data.py`: reserve 1,000 unique
-PKU-SafeRLHF prompts from unused task-source rows (seed 66), excluding normalized
-raw and formatted task-train prompts and both preservation prompt sets. This
-happens after CPU prompt sampling and before GPU context generation. Existing
-evaluation files are checked for duplicates/overlap and reused without overwrite.
-This held-out safety corpus supplies overlap checks; it is not a general/math/code
-benchmark. The Modal workflow still accepts an externally supplied evaluation file.
+the two sets. The checked-in evaluation file contains 1,000 unique prompts sampled
+with seed 66 from the pinned PKU-SafeRLHF test split. Preparation rejects normalized
+overlap with task, projector or KL prompts. After every two committed optimizer
+steps, the updated policy generates one greedy response for every evaluation
+prompt and Qwen3Guard records reward mean, unsafe fraction, parse diagnostics and
+per-prompt results under `validation/step_*.jsonl`. Evaluation does not affect
+gradients or checkpoint selection. This is a held-out safety evaluation, not a
+general/math/code benchmark.
 
 The KL sampler shuffles each domain, interleaves domains in a deterministic global
 order, and takes 48 rows per step without replacement until wrap. Its cursor,
