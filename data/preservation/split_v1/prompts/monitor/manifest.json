@@ -1,0 +1,45 @@
+{
+  "stage": "prompts_only",
+  "seed": 66,
+  "sources": [
+    {
+      "domain": "general",
+      "repo_id": "tatsu-lab/alpaca_farm",
+      "revision": "e576524ca841af3c36fd6912e68e5920430928c1",
+      "filename": "alpaca_instructions/unlabeled.json",
+      "split": "unlabeled",
+      "count": 2000,
+      "file_sha256": "f5b093992641ab1fa73f993d98b02a8e6a2edcd1f9424414413d1a3c6e19c640"
+    },
+    {
+      "domain": "math",
+      "repo_id": "openai/gsm8k",
+      "revision": "740312add88f781978c0658806c59bc2815b9866",
+      "filename": "main/train-00000-of-00001.parquet",
+      "split": "train",
+      "count": 2000,
+      "file_sha256": "ea82612ea9582142387730c793eb67d3b12849002bc0b7fa6f8efafa7351419d"
+    },
+    {
+      "domain": "code",
+      "repo_id": "newfacade/LeetCodeDataset",
+      "revision": "215604aeed660029df7de2fea5a4d7b6ed476a08",
+      "filename": "LeetCodeDataset-train.jsonl",
+      "split": "train",
+      "count": 2000,
+      "file_sha256": "ef7d64d34b092859607c1010bdd23540860a8cfff2ed7aeb0fe82e0ad524919b"
+    }
+  ],
+  "purpose": "monitor",
+  "excluded_prompts_sha256": "af1ebb5eb74980482efef81fa4c72085e09189cadf107910b5acb948e8f509ef",
+  "sampling": "per-domain shuffled rows, global normalized prompt deduplication",
+  "nspo_note": "Source families match NSPO citations; splits and ratios are GRIT choices.",
+  "rows": 6000,
+  "domain_counts": {
+    "math": 2000,
+    "code": 2000,
+    "general": 2000
+  },
+  "parquet": "preserve_prompts.parquet",
+  "parquet_sha256": "11c11602b94bd5495b7d5853c2c2baf977810cc00a01f89a68e0fdd51b91149c"
+}

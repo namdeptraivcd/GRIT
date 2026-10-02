@@ -14,7 +14,6 @@ htmlcov/
 build/
 dist/
 # Generated datasets, weights, checkpoints and logs
-data/
 artifacts/
 checkpoints/
 outputs/
