@@ -11,15 +11,15 @@ import torch
 from torch import nn
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-VERL_ROOT = REPO_ROOT / "verl"
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
-if str(VERL_ROOT) not in sys.path:
-    sys.path.insert(0, str(VERL_ROOT))
-if "verl" in sys.modules and not hasattr(sys.modules["verl"], "DataProto"):
-    del sys.modules["verl"]
 
-from verl.experimental.grit.predictor import clone_current_gradients, temporary_predictor_step
+from grit.predictor import temporary_predictor_step, linear_weight_parameter_names
+
+
+def clone_current_gradients(model):
+    names = linear_weight_parameter_names(model)
+    return {n: p.grad.detach().clone() for n, p in model.named_parameters() if n in names and p.grad is not None}
 
 
 class ToyModel(nn.Module):

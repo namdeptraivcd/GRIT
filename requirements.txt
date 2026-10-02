@@ -1,38 +1,14 @@
-# GRIT local/Qwen3 smoke-run environment.
-#
-# Create the env with Python 3.10:
-#   conda create -n grit-qwen3 python=3.10 -y
-#   conda activate grit-qwen3
-#   pip install -r requirements.txt
-#
-# Do not install this file from Python 3.13+: torch==2.2.2 and numpy<2.0.0
-# do not have compatible wheels there.
-#
-# The full NSPO/verl training stack includes CUDA/Linux-oriented packages such
-# as flash-attn and vllm. This file is intentionally scoped to the dependencies
-# needed by the GRIT utilities, data preparation, projector building, and
-# Qwen2.5-0.5B smoke workflow in this repository.
-numpy<2.0.0
-torch==2.2.2
-transformers==4.53.3
-datasets==4.8.5
-accelerate==1.10.1
-pandas==2.3.3
-pyarrow>=19.0.0
+# Standalone math, data preparation and evaluation. Python 3.10+.
+# GPU training: install requirements-vllm.txt in a separate Linux environment.
+torch>=2.2,<3
+transformers>=4.53,<5
+datasets>=3,<5
+numpy>=1.26,<3
+pandas>=2,<3
+pyarrow>=19
 tqdm
 safetensors
 sentencepiece
-huggingface_hub>=0.30.0,<1.0
-packaging>=20.0
-
-# Minimal verl Phase 1 actor-smoke dependencies. This intentionally avoids the
-# full verl stack in `verl/requirements.txt` because packages such as
-# flash-attn/vllm are CUDA/Linux-oriented and are not needed to test
-# `loss.backward() -> grad_W @ P -> optimizer.step()`.
-codetiming>=1.4.0
-hydra-core>=1.3.2,<1.4
-omegaconf>=2.3.0,<2.4
-ray==2.10.0
-tensordict==0.3.2
-pytest>=8.0.0,<9.0.0
-peft>=0.11.0,<0.18.0
+accelerate>=1,<2
+huggingface_hub>=0.30,<1
+pytest>=8,<9

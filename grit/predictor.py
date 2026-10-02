@@ -5,8 +5,8 @@ after the projected task update:
 
     theta_tilde = theta - learning_rate * projected_grad
 
-This module applies that update in-place under ``torch.no_grad()``, stores only
-the deltas, and restores the original parameters when the context exits.
+This module applies that update in-place under ``torch.no_grad()``, stores
+the original weights, and restores the original parameters when the context exits.
 """
 
 from __future__ import annotations
@@ -95,7 +95,7 @@ def temporary_predictor_step(
 
     Notes:
         This function never calls ``optimizer.step()`` and never mutates
-        gradients. It intentionally stores deltas rather than a full model copy.
+        gradients. It stores the selected original weights for exact restoration.
     """
 
     if learning_rate < 0:
@@ -128,11 +128,12 @@ def temporary_predictor_step(
             delta = grad.detach().to(device=parameter.device, dtype=parameter.dtype).mul(
                 -learning_rate
             )
+            original = parameter.detach().clone()
             if preserve_autograd_graph:
                 parameter.data.add_(delta)
             else:
                 parameter.add_(delta)
-            deltas.append((parameter, delta))
+            deltas.append((parameter, original))
 
             delta_float = delta.float()
             squared_update_norm += float(delta_float.square().sum().item())
@@ -150,9 +151,9 @@ def temporary_predictor_step(
         with torch.no_grad():
             for parameter, delta in reversed(deltas):
                 if preserve_autograd_graph:
-                    parameter.data.sub_(delta)
+                    parameter.data.copy_(delta)
                 else:
-                    parameter.sub_(delta)
+                    parameter.copy_(delta)
 
 
 @contextmanager
@@ -190,8 +191,9 @@ def temporary_predictor_direction_step(
             update = direction.detach().to(
                 device=parameter.device, dtype=parameter.dtype
             ).mul(learning_rate)
+            original = parameter.detach().clone()
             parameter.add_(update)
-            applied.append((parameter, update))
+            applied.append((parameter, original))
 
             update_float = update.float()
             squared_update_norm += float(update_float.square().sum().item())
@@ -207,8 +209,8 @@ def temporary_predictor_direction_step(
         yield info
     finally:
         with torch.no_grad():
-            for parameter, update in reversed(applied):
-                parameter.sub_(update)
+            for parameter, original in reversed(applied):
+                parameter.copy_(original)
 
 
 def forward_with_predictor_step(

@@ -27,14 +27,27 @@ ModuleFilter = Callable[[str, nn.Module], bool]
 
 
 @dataclass
+class CompactProjector:
+    """P = UU^T, or P = I-UU^T when ``complement`` is true."""
+
+    basis: torch.Tensor
+    complement: bool
+    dimension: int
+
+
+@dataclass
 class ProjectorBuildResult:
     """A projector and its spectrum metadata for one module."""
 
-    projector: torch.Tensor
+    compact: CompactProjector
     eigenvalues: torch.Tensor
     threshold_value: float
     nullity: int
     rank: int
+
+    @property
+    def projector(self) -> torch.Tensor:
+        return dense_projector(self.compact)
 
 
 @dataclass(frozen=True)
@@ -65,7 +78,7 @@ def collect_activation_covariances(
     device: torch.device | str | None = None,
     progress_desc: str | None = None,
     progress_total: int | None = None,
-) -> dict[str, torch.Tensor]:
+) -> dict[str, torch.Tensor | CompactProjector]:
     """Collect non-central activation covariances X^T X per protected Linear.
 
     Forward hooks capture each Linear layer's input activations. For a layer with
@@ -124,8 +137,40 @@ def collect_activation_covariances(
     return {name: cov.cpu() for name, cov in covariances.items()}
 
 
-def _unwrap_projector(raw_projector: torch.Tensor | ProjectorBuildResult) -> torch.Tensor:
-    return raw_projector.projector if isinstance(raw_projector, ProjectorBuildResult) else raw_projector
+def _unwrap_projector(raw_projector):
+    return raw_projector.compact if isinstance(raw_projector, ProjectorBuildResult) else raw_projector
+
+
+def projector_dimension(projector) -> int:
+    projector = _unwrap_projector(projector)
+    if isinstance(projector, CompactProjector):
+        return projector.dimension
+    if torch.is_tensor(projector) and projector.ndim == 2 and projector.shape[0] == projector.shape[1]:
+        return projector.shape[0]
+    raise TypeError(f"Unsupported projector representation: {type(projector).__name__}")
+
+
+def project_with_projector(value: torch.Tensor, projector) -> torch.Tensor:
+    projector = _unwrap_projector(projector)
+    if isinstance(projector, CompactProjector):
+        if value.shape[-1] != projector.dimension:
+            raise ValueError("Compact projector dimension mismatch; local parameter shards are unsupported")
+        basis = projector.basis.to(device=value.device, dtype=value.dtype)
+        component = value.matmul(basis).matmul(basis.transpose(0, 1))
+        return value-component if projector.complement else component
+    projector = projector.to(device=value.device, dtype=value.dtype)
+    if value.shape[-1] != projector.shape[0]:
+        raise ValueError("Dense projector dimension mismatch; local parameter shards are unsupported")
+    return value.matmul(projector)
+
+
+def dense_projector(projector) -> torch.Tensor:
+    projector = _unwrap_projector(projector)
+    if torch.is_tensor(projector):
+        return projector
+    basis = projector.basis
+    product = basis.matmul(basis.transpose(0, 1))
+    return torch.eye(projector.dimension, dtype=basis.dtype, device=basis.device)-product if projector.complement else product
 
 
 def load_projectors(
@@ -146,17 +191,17 @@ def load_projectors(
     if not isinstance(payload, Mapping):
         raise TypeError(f"projector artifact must contain a mapping, got {type(payload).__name__}")
 
-    projectors: dict[str, torch.Tensor] = {}
+    projectors: dict[str, torch.Tensor | CompactProjector] = {}
     for name, projector in payload.items():
         if not isinstance(name, str):
             raise TypeError(f"projector name must be str, got {type(name).__name__}")
-        if isinstance(projector, ProjectorBuildResult):
-            projector = projector.projector
-        if not torch.is_tensor(projector):
-            raise TypeError(f"projector for {name!r} must be a Tensor, got {type(projector).__name__}")
-        if projector.ndim != 2 or projector.shape[0] != projector.shape[1]:
-            raise ValueError(f"projector for {name!r} must be square, got shape {tuple(projector.shape)}")
-        projectors[name] = projector.detach().cpu()
+        projector = _unwrap_projector(projector)
+        projector_dimension(projector)
+        if isinstance(projector, CompactProjector):
+            projector = CompactProjector(projector.basis.detach().cpu(), projector.complement, projector.dimension)
+        else:
+            projector = projector.detach().cpu()
+        projectors[name] = projector
     return projectors
 
 
@@ -170,7 +215,7 @@ def attach_projectors_to_modules(
 ) -> ProjectorAttachResult:
     """Attach projector tensors to matching Linear modules.
 
-    This mirrors the way a ``verl`` actor worker should load projectors once
+    A training worker can load projectors once
     during model setup. The actual optimizer-facing operation remains gradient
     projection after task-loss backward, not NSPO's periodic weight repair.
     """
@@ -191,10 +236,10 @@ def attach_projectors_to_modules(
         if name not in projectors:
             missing.append(name)
             continue
-        projector = _unwrap_projector(projectors[name]).detach().cpu()
+        projector = _unwrap_projector(projectors[name])
         expected_shape = (module.in_features, module.in_features)
-        if tuple(projector.shape) != expected_shape:
-            shape_mismatch.append(f"{name}: got {tuple(projector.shape)}, expected {expected_shape}")
+        if projector_dimension(projector) != module.in_features:
+            shape_mismatch.append(f"{name}: got dimension {projector_dimension(projector)}, expected {module.in_features}")
             continue
         setattr(module, attribute_name, projector)
         attached.append(name)
@@ -232,8 +277,7 @@ def attached_projectors(
             continue
         projector = getattr(module, attribute_name, None)
         if projector is not None:
-            if not torch.is_tensor(projector):
-                raise TypeError(f"attached projector {attribute_name!r} on {name!r} must be a Tensor")
+            projector_dimension(projector)
             projectors[name] = projector
     return projectors
 
@@ -270,23 +314,18 @@ def build_projectors_from_covariances(
             null_mask = torch.ones_like(eigenvalues, dtype=torch.bool)
         else:
             null_mask = eigenvalues < threshold_value
-        null_vectors = eigenvectors[:, null_mask]
-        if null_vectors.numel() == 0:
-            projector = torch.zeros(
-                (matrix.shape[0], matrix.shape[0]),
-                dtype=torch.float32,
-                device=matrix.device,
-            )
-        else:
-            projector = null_vectors.matmul(null_vectors.transpose(0, 1)).contiguous()
-
         nullity = int(null_mask.sum().item())
+        rank = matrix.shape[0]-nullity
+        if nullity <= rank:
+            compact = CompactProjector(eigenvectors[:, null_mask].contiguous().cpu(), False, matrix.shape[0])
+        else:
+            compact = CompactProjector(eigenvectors[:, ~null_mask].contiguous().cpu(), True, matrix.shape[0])
         results[name] = ProjectorBuildResult(
-            projector=projector.cpu(),
+            compact=compact,
             eigenvalues=eigenvalues.cpu(),
             threshold_value=threshold_value,
             nullity=nullity,
-            rank=matrix.shape[0] - nullity,
+            rank=rank,
         )
 
     return results
@@ -316,16 +355,8 @@ def apply_gradient_projection(
             continue
 
         raw_projector = projectors[name]
-        projector = _unwrap_projector(raw_projector)
-        projector = projector.to(device=module.weight.grad.device, dtype=module.weight.grad.dtype)
-        if tuple(projector.shape) != (module.weight.shape[1], module.weight.shape[1]):
-            raise ValueError(
-                f"projector for {name!r} has shape {tuple(projector.shape)}, "
-                f"expected {(module.weight.shape[1], module.weight.shape[1])}"
-            )
-
         before = module.weight.grad.detach().float().norm()
-        module.weight.grad.copy_(module.weight.grad.matmul(projector))
+        module.weight.grad.copy_(project_with_projector(module.weight.grad, raw_projector))
         after = module.weight.grad.detach().float().norm()
 
         metrics[f"{name}.grad_norm_before"] = float(before.item())
@@ -350,8 +381,21 @@ def apply_attached_gradient_projection(
     return apply_gradient_projection(model, projectors, module_filter=module_filter)
 
 
-def projector_diagnostics(projector: torch.Tensor) -> dict[str, float]:
+def projector_diagnostics(projector: torch.Tensor | CompactProjector) -> dict[str, float]:
     """Return symmetry/idempotence diagnostics for an orthogonal projector."""
+
+    projector = _unwrap_projector(projector)
+    if isinstance(projector, CompactProjector):
+        basis = projector.basis.float()
+        gram = basis.transpose(0, 1).matmul(basis)
+        identity = torch.eye(gram.shape[0], device=gram.device, dtype=gram.dtype)
+        orthogonality_error = torch.linalg.vector_norm(gram-identity) if gram.numel() else torch.tensor(0.0)
+        nonzero = projector.dimension > basis.shape[1] if projector.complement else basis.shape[1] > 0
+        return {
+            "symmetry_error": 0.0,
+            "idempotence_error": float(orthogonality_error),
+            "spectral_norm": float(nonzero),
+        }
 
     p = projector.float()
     symmetry_error = (p - p.transpose(0, 1)).norm()

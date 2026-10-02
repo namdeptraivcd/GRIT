@@ -17,7 +17,15 @@ if str(REPO_ROOT) not in sys.path:
 
 from grit.preservation_loss import preservation_kl_loss
 from grit.update import GritUpdateConfig, assemble_grit_update
-from scripts.train_grit_dpo import grpo_safety_task_loss, sequence_log_probs
+from grit.grpo import group_advantages, grpo_loss, token_log_probs
+
+
+def grpo_safety_task_loss(model, batch, old_log_probs, rewards, *, group_size, clip_ratio):
+    values, mask = token_log_probs(model, batch)
+    advantages = group_advantages(rewards, group_size)
+    loss = grpo_loss(values, old_log_probs, advantages, mask, clip_ratio)
+    return loss, {"reward_mean": float(rewards.mean()), "unsafe_fraction": float(rewards.eq(-1).float().mean()),
+                  "adv_abs_mean": float(advantages.abs().mean()), "ratio_mean": float((values-old_log_probs).exp().mean().detach())}
 
 
 class TinyCausalPolicy(nn.Module):
@@ -74,7 +82,7 @@ def main() -> None:
             ]
         ),
     }
-    old_log_probs = sequence_log_probs(model, rollout_batch).detach()
+    old_log_probs = token_log_probs(model, rollout_batch)[0].detach()
     rewards = torch.tensor([0.0, -1.0, -1.0, 0.0])
     task_loss, grpo_metrics = grpo_safety_task_loss(
         model,
@@ -186,8 +194,8 @@ def main() -> None:
             learning_rate=0.1,
             lambda_pres=0.5,
             use_curvature=True,
-            curvature_mode="sam_fd",
-            sam_rho=1e-3,
+            curvature_mode="central_fd",
+            fd_radius=1e-3,
             hvp_last_linear_layers=1,
             missing_projector="identity",
         ),
@@ -195,10 +203,10 @@ def main() -> None:
     )
     assert sam_result.curvature is not None
     assert not sam_result.curvature.skipped_hvp
-    assert sam_result.metrics["grit/curvature_mode_sam_fd"] == 1.0
+    assert sam_result.metrics["grit/curvature_mode_central_fd"] == 1.0
     assert sam_result.metrics["grit/hvp_norm"] > 0.0
     assert_parameters_restored(model, baseline_parameters)
-    print("sam_fd_curvature_update=True")
+    print("central_fd_curvature_update=True")
     print(f"sam_hvp_norm={sam_result.metrics['grit/hvp_norm']:.8f}")
 
 

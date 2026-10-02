@@ -1,118 +1,135 @@
-# NSPO-domain preservation data
+# Split preservation data
 
-The GRIT preservation sources are AlpacaFarm, GSM8K and LeetCodeDataset, matching
-the references in [NSPO section 5.1](https://arxiv.org/html/2512.11391v1#S5.SS1).
-The exact splits and balanced allocation below are our reproducible choices,
-not verified reconstruction of NSPO's sample list.
+GRIT uses separate projector, KL, and evaluation prompt roles.
 
-| Source | Split/file | Prompts |
-|---|---|---:|
-| [AlpacaFarm](https://huggingface.co/datasets/tatsu-lab/alpaca_farm) | `alpaca_instructions/unlabeled.json` | 334 |
-| [GSM8K](https://huggingface.co/datasets/openai/gsm8k) | `main/train` | 333 |
-| [LeetCodeDataset](https://huggingface.co/datasets/newfacade/LeetCodeDataset) | `train` | 333 |
+| Role | General | Math | Code | Total |
+| --- | ---: | ---: | ---: | ---: |
+| Fixed projector construction | 334 | 333 | 333 | **1,000** |
+| KL trust-region training/monitoring | 2,000 | 2,000 | 2,000 | **6,000** |
+| Evaluation | supplied separately | supplied separately | supplied separately | external |
 
-Pinned source revisions and seed 66 are in `config/preservation/nspo_mix.json`.
-AlpacaFarm combines `instruction` and optional `input`. GSM8K uses `question`.
-LeetCodeDataset uses `query`, which includes the problem and coding instructions;
-its `prompt` column is mostly shared code imports. Existing answers/solutions
-are not used as preservation targets. Sampling removes normalized duplicate
-prompts globally. Official evaluation splits are not sampled; this does not
-establish absence of cross-benchmark overlap (especially among coding benchmarks).
+The source revisions, seed 66, and allocations are pinned in
+`config/preservation/nspo_mix.json` and `nspo_monitor.json`. Projector and KL
+sampling normalizes Unicode, whitespace, and case before hashing prompts. The KL
+sample excludes every projector hash. Training also reads `--evaluation-file`
+and rejects any normalized prompt shared by evaluation and either preservation
+role. Exact hash disjointness does not prove semantic non-overlap.
 
-## 1. Prepare the prompt pool
+The KL corpus contributes gradients and is therefore training data. It must not
+be presented as held-out evaluation data.
 
-Use the repository Python environment. For this stage alone the dependencies are
-`pyarrow` and `huggingface_hub`:
+## Prepare artifacts
 
-```bash
-python -m pip install pyarrow huggingface_hub
-python scripts/prepare_preservation_data.py sample
-```
-
-Outputs under `data/preservation/nspo_mix/`:
-
-- `preserve_prompts.parquet`: 1,000 prompt-only records, including a `text` column.
-- `prompts.jsonl`: the same records in a readable format.
-- `manifest.json`: source revisions/checksums, counts, seed, and artifact checksum.
-
-The manifest marks this stage `prompts_only`. This is sufficient for prompt-only
-projector experiments, but the plan's response-context KL requires step 2.
-The command refuses to overwrite an existing output directory. For a repeatability
-check, use `--output-dir data/preservation/nspo_mix_repeat`.
-
-## 2. Generate fixed-base response contexts
-
-Run in the GRIT model environment (`requirements.txt`, or the existing Kaggle
-environment). Generation uses the frozen base model's chat template and greedy
-decoding, one prompt at a time. It records the resolved model revision, tokenizer
-fingerprint, exact token IDs, and response boundary. Greedy decoding is repeatable
-within a fixed environment; it is not a promise of bitwise equality across hardware.
-
-First verify a short run:
+The current frozen base is `Qwen/Qwen2.5-3B-Instruct` at commit
+`aa8e72537993ba99e69dfaafa59ed015b17504d1`.
 
 ```bash
-python scripts/prepare_preservation_data.py generate \
-  --prompts data/preservation/nspo_mix/preserve_prompts.parquet \
-  --output-dir data/preservation/qwen2_5_0_5b_smoke \
-  --model-path Qwen/Qwen2.5-0.5B-Instruct \
-  --limit 3 --max-new-tokens 16
+MODEL_PATH=Qwen/Qwen2.5-3B-Instruct \
+MODEL_REVISION=aa8e72537993ba99e69dfaafa59ed015b17504d1 \
+bash scripts/run_preservation_projectors.sh all
 ```
 
-Then generate all 1,000:
+The `sample`, `generate`, `build`, and `all` stages remain available. Prompt-only
+sampling does not load the model:
 
 ```bash
-python scripts/prepare_preservation_data.py generate \
-  --prompts data/preservation/nspo_mix/preserve_prompts.parquet \
-  --output-dir data/preservation/qwen2_5_0_5b \
-  --model-path Qwen/Qwen2.5-0.5B-Instruct \
-  --max-prompt-length 2048 --max-new-tokens 256
+bash scripts/run_preservation_projectors.sh sample
 ```
 
-Output `preserve_contexts.parquet` includes `text` (decoded full chat), `input_ids`,
-`response_start`, `response_mask`, `base_response`, `base_model`, `base_revision`,
-`tokenizer_sha256`, and source metadata. Masks here align to the full token sequence;
-the standalone trainer shifts them for next-token loss. This is not the fixed-width
-`DataProto` schema consumed by the separate `verl` preservation loader.
-
-`contexts.partial.jsonl` is retained if generation fails. Only a successful run
-gets the final parquet and completion manifest. Use a fresh output directory to
-retry; partial-run resume is not implemented. Long prompts fail explicitly instead
-of silently removing the problem statement. Increase the prompt limit if needed.
-
-## 3. Use the new artifacts
-
-Rebuild projectors when changing preservation data. Point the existing builder at
-`preserve_contexts.parquet`, `--text-column text`, and `--max-length 2304` to cover
-the default 2048+256 token budget. Use the same base checkpoint/revision as the
-generation manifest (a local Hugging Face snapshot path can pin the builder).
-The builder retokenizes `text`; the standalone KL loader uses stored token IDs.
-
-For standalone training, pass:
+Outputs use model-specific `split_v1` paths:
 
 ```text
---preserve-file data/preservation/qwen2_5_0_5b/preserve_contexts.parquet
---projectors-path <new projector artifact>
---model-revision <base_revision from the generation manifest>
---max-preserve-length 2304
+data/preservation/split_v1/qwen--qwen2.5-3b-instruct/projector/preserve_contexts.parquet
+data/preservation/split_v1/qwen--qwen2.5-3b-instruct/monitor/preserve_contexts.parquet
+artifacts/qwen--qwen2.5-3b-instruct_split_v1_projectors.pt
 ```
 
-When using `run_kaggle_grit_train.sh`, set `PRESERVE_FILE` and `PROJECTORS_PATH`
-environment variables to those files, and append `--model-revision` and
-`--max-preserve-length` as CLI overrides. Existing text-only data remains supported.
-The new loader checks tokenizer identity and the base revision and computes KL
-only over generated response tokens. A 2304-token budget can require substantially
-more preservation memory than the old 256-token smoke configuration.
+Historical artifacts are not overwritten. Complete artifacts are reused only
+after provenance validation. Incomplete generation remains as
+`contexts.partial.jsonl`; partial generation is not resumed in place.
 
-All generated datasets and model/cache files stay out of Git. Only the scripts,
-source config, tests and documentation are versioned.
+## Frozen-base statistics
 
-## Validation
+The same pinned base model generates responses for both preservation corpora.
+Generation is greedy. Prompt IDs come from the policy chat template, and stored
+context IDs are consumed without retokenizing decoded text.
+
+For every generated response token, preparation runs a teacher-forced Hugging
+Face forward in the configured dtype, default FP16. It stores:
+
+- `base_topk_ids`: the frozen-base top-64 IDs;
+- `base_topk_log_probs`: frozen-base log-probabilities for those IDs;
+- `base_log_tail`: remaining probability mass as one finite log class;
+- `base_top_k=64` and `base_statistics_dtype`.
+
+The manifest records the same values, base revision, tokenizer fingerprint,
+source checksums, and output checksum. Training rejects `k`, dtype, revision, or
+tokenizer mismatches. These statistics come from teacher forcing, never from
+vLLM generation-time log-probabilities.
+
+The trainer computes current-policy mass for the fixed base IDs and derives the
+current tail from the full-vocabulary logsumexp. All trust-region math therefore
+uses 65 classes. Only response-token next-token positions are active. The
+Proposition 2 TV bound applies to the coarsened 65-class distribution.
+
+Storing statistics removes the need for a frozen FP32 3B model in each actor,
+saving about 12.344 GB of actor GPU memory.
+
+## Projectors
+
+Projector construction consumes only the 1,000-row projector context file. It
+records the construction checksum and normalized prompt hashes. The KL file is
+validated against those hashes before training.
+
+For a protected input dimension `d`, the builder computes the activation
+covariance and its eigenspaces. It serializes the hard projector as either
+`U U^T` or `I-U U^T`, choosing the smaller basis. This avoids storing a dense
+matrix in the final artifact. For Qwen2.5-3B `down_proj`, `d=11008`; one dense
+FP32 matrix would be 484,704,256 bytes (484.7 MB, 462.25 MiB).
+
+## Per-step sampling
+
+The KL sampler creates one deterministic global order by shuffling within each
+domain and interleaving domains. Actor ranks take disjoint slices of the global
+48-row step batch. With four actors each rank receives 12 rows. The sampler does
+not repeat a row until wrap and reshuffles for the next epoch. Its cursor and
+configuration are checkpointed.
+
+A 40-step run consumes 1,920 distinct KL rows, 32% of the 6,000-row corpus. Full
+coverage requires 125 steps. Metrics must describe sampled-step coverage rather
+than claiming that the 40-step run covers the corpus.
+
+## Training inputs
+
+For preservation-enabled training, pass all of the following:
+
+```text
+--preserve-file <monitor preserve_contexts.parquet>
+--projectors-path <compact projectors.pt>
+--evaluation-file <reserved evaluation_prompts.parquet>
+--model-revision aa8e72537993ba99e69dfaafa59ed015b17504d1
+--top-k 64
+--base-statistics-dtype float16
+--max-preserve-length 2304
+--preserve-batch-size 48
+```
+
+The evaluation parquet must have a nonempty `prompt` column and unique normalized
+prompts. This repository does not synthesize it from training sources. Modal
+training stops before GPU work if the file is absent.
+
+## Verification
 
 ```bash
+python -m pytest -q
 python test_function/check_preservation_data.py
+python test_function/check_trust_region_preservation.py
+python test_function/check_projection.py
+bash -n scripts/*.sh
 ```
 
-Tests cover source formatting, reproducible sampling, duplicate removal, insufficient
-unique samples, response boundaries, padding, truncation and tokenizer mismatch.
-Model generation and GPU training are separate checks; these unit tests do not
-establish end-to-end training correctness.
+The checks cover counts, exclusion sampling, overlap rejection including
+evaluation, exact response boundaries, stored-statistic alignment, fixed top-64
+plus tail math, and compact projector serialization. GPU preparation time,
+CUDA/vLLM compatibility, and training memory fit require target-hardware
+validation.

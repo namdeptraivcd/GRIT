@@ -4,10 +4,10 @@ GRIT's exact preservation gradient corrects the first-order preservation pull
 
     v = grad_{theta_tilde} L_pres(theta_tilde)
 
-with the Hessian-vector product from differentiating through the task descent
-predictor step:
+with a Hessian-vector product through the task descent predictor. ``Q`` may be
+the hard projector ``P`` or its relaxed form:
 
-    v - learning_rate * H_task(theta) P v
+    v - learning_rate * H_task(theta) Q v
 
 This module computes the product without materializing a Hessian.
 """
@@ -20,7 +20,7 @@ from dataclasses import dataclass
 import torch
 from torch import nn
 
-from grit.projection import ProjectorBuildResult, default_module_filter
+from grit.projection import ProjectorBuildResult, default_module_filter, project_with_projector
 
 
 ModuleFilter = Callable[[str, nn.Module], bool]
@@ -97,11 +97,14 @@ def project_vector_with_module_projectors(
     parameters: Sequence[NamedParameter] | None = None,
     module_filter: ModuleFilter | None = None,
     missing: str = "identity",
+    relaxation: float = 0.0,
 ) -> dict[str, torch.Tensor]:
-    """Apply the GRIT/NSPO block projector to a named parameter vector.
+    """Apply a hard or relaxed GRIT/NSPO projector to a named vector.
 
-    Linear weights with a matching module projector use ``u_W = v_W @ P``.
-    Parameters outside that surface default to identity in ``u = P v``:
+    Protected Linear weights use ``Q = P + relaxation * (I-P)`` and
+    ``u_W = v_W @ Q``. Thus relaxation=0 is the hard NSPO projector and
+    relaxation=1 is identity. Parameters outside that surface stay unchanged.
+    Parameters outside that surface default to identity in ``u = Q v``:
     Phase 1 supplies nontrivial projectors only for protected Linear weights,
     while the full-theta block operator leaves unprojected parameters unchanged.
     Set ``missing="zero"`` only for a Linear-only ablation.
@@ -109,6 +112,8 @@ def project_vector_with_module_projectors(
 
     if missing not in {"zero", "identity"}:
         raise ValueError(f"missing must be 'zero' or 'identity', got {missing!r}")
+    if not 0.0 <= relaxation <= 1.0:
+        raise ValueError(f"relaxation must be in [0, 1], got {relaxation}")
     if module_filter is None:
         module_filter = lambda name, module: default_module_filter(name, module)
     if parameters is None:
@@ -137,10 +142,10 @@ def project_vector_with_module_projectors(
             and module_filter(module_name, module)
             and module_name in projectors
         ):
-            raw_projector = projectors[module_name]
-            projector = raw_projector.projector if isinstance(raw_projector, ProjectorBuildResult) else raw_projector
-            projector = projector.to(device=value.device, dtype=value.dtype)
-            projected[parameter_name] = value.matmul(projector)
+            projected_value = project_with_projector(value, projectors[module_name])
+            if relaxation:
+                projected_value.mul_(1.0-relaxation).add_(value, alpha=relaxation)
+            projected[parameter_name] = projected_value
         elif missing == "identity":
             projected[parameter_name] = value.detach().clone()
         else:
@@ -216,11 +221,12 @@ def curvature_corrected_preservation_gradients(
     module_filter: ModuleFilter | None = None,
     hvp_parameters: Sequence[NamedParameter] | None = None,
     missing_projector: str = "identity",
+    projector_relaxation: float = 0.0,
 ) -> CurvatureCorrectionResult:
-    """Return ``v - learning_rate * H_task P v`` as named gradients.
+    """Return ``v - learning_rate * H_task Q v`` as named gradients.
 
-    ``P`` is treated as a full-theta block operator: protected Linear weights
-    use their Phase 1 projector, and parameters without a projector use the
+    ``Q`` is treated as a full-theta block operator: protected Linear weights
+    use the relaxed Phase 1 projector, and parameters without a projector use the
     identity block. ``task_loss`` should have the sign used by the optimizer.
     If the training code minimizes ``task_loss = -J_task``, then the returned
     HVP is the Hessian of that minimization loss, not the Hessian of ``J_task``.
@@ -251,6 +257,7 @@ def curvature_corrected_preservation_gradients(
         parameters=parameters,
         module_filter=module_filter,
         missing=missing_projector,
+        relaxation=projector_relaxation,
     )
 
     if hvp_parameters is None:
@@ -304,12 +311,12 @@ def finite_difference_curvature_corrected_preservation_gradients(
     module_filter: ModuleFilter | None = None,
     hvp_parameters: Sequence[NamedParameter] | None = None,
     missing_projector: str = "identity",
+    projector_relaxation: float = 0.0,
 ) -> CurvatureCorrectionResult:
-    """Approximate ``v - learning_rate * H_task P v`` with a SAM-style finite difference.
+    """Approximate ``v - learning_rate * H_task Q v`` with a central difference.
 
-    The perturbation direction is ``P v``. With ``normalize_direction=True`` the
-    model is perturbed by ``rho * P v / ||P v||`` and the finite difference is
-    rescaled to approximate ``H_task P v`` rather than ``H_task normalize(P v)``.
+    The perturbation direction is ``Q v``. With ``normalize_direction=True`` the
+    finite difference is rescaled to approximate ``H_task Q v``.
     """
 
     if learning_rate < 0:
@@ -339,6 +346,7 @@ def finite_difference_curvature_corrected_preservation_gradients(
         parameters=parameters,
         module_filter=module_filter,
         missing=missing_projector,
+        relaxation=projector_relaxation,
     )
 
     if hvp_parameters is None:
@@ -356,39 +364,31 @@ def finite_difference_curvature_corrected_preservation_gradients(
         hvp = {name: _zero_like_parameter(parameter) for name, parameter in parameters}
     else:
         scale = (rho / projected_vector_norm) if normalize_direction else rho
-        restore: list[tuple[nn.Parameter, torch.Tensor]] = []
-        with torch.no_grad():
-            for name, parameter in hvp_parameters:
-                direction = hvp_projected_vector[name].to(device=parameter.device, dtype=parameter.dtype)
-                perturbation = direction.mul(scale)
-                parameter.add_(perturbation)
-                restore.append((parameter, perturbation.detach().clone()))
+        originals = {name: parameter.detach().clone() for name, parameter in hvp_parameters}
+        cpu_rng = torch.get_rng_state()
+        cuda_rng = torch.cuda.get_rng_state_all() if torch.cuda.is_initialized() else []
+        sides = []
         try:
-            perturbed_loss = task_loss_fn()
-            perturbed_partial = torch.autograd.grad(
-                perturbed_loss,
-                [parameter for _, parameter in hvp_parameters],
-                retain_graph=False,
-                allow_unused=True,
-            )
+            for sign in (1, -1):
+                with torch.no_grad():
+                    for name, parameter in hvp_parameters:
+                        parameter.copy_(originals[name] + sign * scale * hvp_projected_vector[name].to(parameter))
+                torch.set_rng_state(cpu_rng)
+                if cuda_rng:
+                    torch.cuda.set_rng_state_all(cuda_rng)
+                loss = task_loss_fn()
+                grads = torch.autograd.grad(loss, [p for _, p in hvp_parameters], allow_unused=True)
+                sides.append([torch.zeros_like(p) if g is None else g.detach()
+                              for (_, p), g in zip(hvp_parameters, grads)])
         finally:
             with torch.no_grad():
-                for parameter, perturbation in restore:
-                    parameter.sub_(perturbation)
-
-        base_scale = (projected_vector_norm / rho) if normalize_direction else (1.0 / rho)
-        base_gradients = task_gradients
-        partial_hvp: dict[str, torch.Tensor] = {}
-        for (name, parameter), perturbed_grad in zip(hvp_parameters, perturbed_partial, strict=True):
-            if perturbed_grad is None:
-                partial_hvp[name] = _zero_like_parameter(parameter)
-                continue
-            base_grad = base_gradients.get(name)
-            if base_grad is None:
-                base_grad = _zero_like_parameter(parameter)
-            partial_hvp[name] = (
-                perturbed_grad.detach() - base_grad.detach().to(perturbed_grad)
-            ).mul(base_scale)
+                for name, parameter in hvp_parameters:
+                    parameter.copy_(originals[name])
+            torch.set_rng_state(cpu_rng)
+            if cuda_rng:
+                torch.cuda.set_rng_state_all(cuda_rng)
+        partial_hvp = {name: (plus-minus)/(2*scale)
+                       for (name, _), plus, minus in zip(hvp_parameters, *sides)}
 
         hvp = {name: _zero_like_parameter(parameter) for name, parameter in parameters}
         hvp.update(partial_hvp)

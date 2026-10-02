@@ -48,6 +48,7 @@ def main() -> None:
     covariance = basis.transpose(0, 1).matmul(basis)
     results = build_projectors_from_covariances({"mlp": covariance}, relative_threshold=5e-4)
     projector = results["mlp"].projector
+    compact = results["mlp"].compact
 
     model = ToyModel()
     loss = model(torch.randn(8, 4))
@@ -59,7 +60,7 @@ def main() -> None:
 
     with TemporaryDirectory() as tmpdir:
         artifact_path = Path(tmpdir) / "projectors.pt"
-        torch.save({"projectors": {"mlp": projector}}, artifact_path)
+        torch.save({"projectors": {"mlp": compact}}, artifact_path)
         loaded_projectors = load_projectors(artifact_path)
 
     attached_model = ToyModel()
@@ -71,6 +72,7 @@ def main() -> None:
     attached_after = attached_model.mlp.weight.grad.detach()
 
     diag = projector_diagnostics(projector)
+    compact_diag = projector_diagnostics(compact)
     leakage = after.matmul(covariance).norm().item()
     attached_leakage = attached_after.matmul(covariance).norm().item()
 
@@ -97,6 +99,8 @@ def main() -> None:
     assert "mlp.grad_norm_after" in attached_metrics
     assert diag["symmetry_error"] < 1e-6
     assert diag["idempotence_error"] < 1e-6
+    assert compact_diag["idempotence_error"] < 1e-6
+    assert compact_diag["spectral_norm"] == 1.0
 
 
 if __name__ == "__main__":

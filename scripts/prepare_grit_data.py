@@ -46,6 +46,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--preserve-split", default="train")
     parser.add_argument("--preserve-text-column", default=None)
     parser.add_argument("--preserve-max-samples", type=int, default=1000)
+    parser.add_argument("--task-only", action="store_true", help="Write task train/validation files only")
     parser.add_argument(
         "--preserve-only",
         action="store_true",
@@ -220,6 +221,8 @@ def build_custom_preserve_rows(args: argparse.Namespace) -> list[dict[str, str]]
 
 def main() -> None:
     args = parse_args()
+    if args.task_only and args.preserve_only:
+        raise ValueError("Choose --task-only or --preserve-only, not both")
 
     from datasets import Dataset
 
@@ -247,6 +250,9 @@ def main() -> None:
         Dataset.from_list(val_rows).to_parquet(str(val_path))
         print(f"task_train={train_path} rows={len(train_rows)}")
         print(f"task_val={val_path} rows={len(val_rows)}")
+
+    if args.task_only:
+        return
 
     if args.preserve_dataset:
         print(f"[4/4] Loading custom preservation dataset: {args.preserve_dataset}", flush=True)

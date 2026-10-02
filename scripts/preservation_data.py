@@ -5,12 +5,63 @@ from __future__ import annotations
 import hashlib
 import json
 import random
+import re
 import unicodedata
+from pathlib import Path
+
+
+def preservation_paths(data_root, artifact_root, model_path: str) -> dict[str, str]:
+    """New, model-specific paths leave historical shared-corpus artifacts intact."""
+    model_key = re.sub(r"[^a-zA-Z0-9._-]", "--", model_path).lower()
+    root = Path(data_root) / "preservation" / "split_v1" / model_key
+    return {
+        "projector_contexts": str(root / "projector" / "preserve_contexts.parquet"),
+        "preserve_file": str(root / "monitor" / "preserve_contexts.parquet"),
+        "projectors_path": str(Path(artifact_root) / f"{model_key}_split_v1_projectors.pt"),
+    }
 
 
 def prompt_key(text: str) -> str:
     normalized = " ".join(unicodedata.normalize("NFKC", text).split()).casefold()
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def preservation_prompt_hashes(rows) -> set[str]:
+    """Identify source prompts, independently of stored metadata or responses."""
+    hashes = set()
+    for row in rows:
+        prompt = row.get("prompt")
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ValueError("Split preservation data requires the original prompt column")
+        key = prompt_key(prompt)
+        if row.get("prompt_sha256", key) != key:
+            raise ValueError("Preservation prompt checksum mismatch")
+        if key in hashes:
+            raise ValueError("Duplicate normalized preservation prompt")
+        hashes.add(key)
+    return hashes
+
+
+def validate_monitoring_split(projector_payload: dict, rows, evaluation_rows=None) -> None:
+    """Require KL training prompts to be disjoint from projector construction."""
+    projector_hashes = projector_payload.get("projector_prompt_sha256")
+    if not projector_hashes:
+        raise ValueError("Projector lacks prompt provenance; rebuild for split preservation data")
+    monitoring_hashes = preservation_prompt_hashes(rows)
+    if not monitoring_hashes:
+        raise ValueError("Empty KL monitoring corpus")
+    overlap = set(projector_hashes) & monitoring_hashes
+    if overlap:
+        raise ValueError(f"Projector and KL monitoring overlap on {len(overlap)} normalized prompts")
+    if evaluation_rows is not None:
+        evaluation_hashes = preservation_prompt_hashes(evaluation_rows)
+        projector_overlap = set(projector_hashes) & evaluation_hashes
+        monitoring_overlap = monitoring_hashes & evaluation_hashes
+        if projector_overlap or monitoring_overlap:
+            raise ValueError(
+                "Preservation/evaluation prompt overlap: "
+                f"projector={len(projector_overlap)}, monitoring={len(monitoring_overlap)}"
+            )
 
 
 def source_prompt(row: dict, domain: str) -> str:
@@ -111,3 +162,41 @@ def stored_preservation_batch(tokenizer, rows, *, max_length: int):
     attention = torch.tensor(attention, dtype=torch.long)
     response = torch.tensor(response, dtype=torch.bool)
     return input_ids, attention, input_ids[:, 1:].contiguous(), response[:, 1:].contiguous()
+
+
+def stored_topk_preservation_batch(tokenizer, rows, *, max_length: int, top_k: int):
+    """Return exact contexts plus stored base top-k/tail statistics aligned to logits."""
+    import torch
+
+    ids, attention, response = stored_context_arrays(tokenizer, rows, max_length=max_length)
+    width = len(ids[0])
+    top_ids, top_logp, log_tail = [], [], []
+    for row, sequence in zip(rows, ids, strict=True):
+        if int(row.get("base_top_k", -1)) != top_k:
+            raise ValueError("Stored base top-k does not match --top-k")
+        start = int(row["response_start"])
+        response_count = min(len(row["input_ids"]), max_length)-start
+        row_ids = list(row.get("base_topk_ids", []))[:response_count]
+        row_logp = list(row.get("base_topk_log_probs", []))[:response_count]
+        row_tail = list(row.get("base_log_tail", []))[:response_count]
+        if not (len(row_ids) == len(row_logp) == len(row_tail) == response_count):
+            raise ValueError("Stored base statistics do not cover every retained response token")
+        if any(len(values) != top_k for values in row_ids+row_logp):
+            raise ValueError("Stored base top-k row has the wrong class count")
+        aligned_ids = [[0]*top_k for _ in range(width-1)]
+        aligned_logp = [[0.0]*top_k for _ in range(width-1)]
+        aligned_tail = [0.0]*(width-1)
+        for offset, (token_ids, log_probs, tail) in enumerate(zip(row_ids, row_logp, row_tail, strict=True)):
+            position = start-1+offset
+            aligned_ids[position] = token_ids
+            aligned_logp[position] = log_probs
+            aligned_tail[position] = tail
+        top_ids.append(aligned_ids)
+        top_logp.append(aligned_logp)
+        log_tail.append(aligned_tail)
+    return (
+        torch.tensor(ids, dtype=torch.long), torch.tensor(attention, dtype=torch.long),
+        torch.tensor(response, dtype=torch.bool)[:, 1:].contiguous(),
+        torch.tensor(top_ids, dtype=torch.long), torch.tensor(top_logp, dtype=torch.float32),
+        torch.tensor(log_tail, dtype=torch.float32),
+    )

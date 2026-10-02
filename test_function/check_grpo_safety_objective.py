@@ -13,7 +13,16 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.train_grit_dpo import grpo_safety_task_loss, parse_safety_reward
+from grit.data import parse_safety_reward
+from grit.grpo import group_advantages, grpo_loss, token_log_probs
+
+
+def grpo_safety_task_loss(model, batch, old_log_probs, rewards, *, group_size, clip_ratio):
+    values, mask = token_log_probs(model, batch)
+    advantages = group_advantages(rewards, group_size)
+    loss = grpo_loss(values, old_log_probs, advantages, mask, clip_ratio)
+    return loss, {"reward_mean": float(rewards.mean()), "unsafe_fraction": float(rewards.eq(-1).float().mean()),
+                  "adv_abs_mean": float(advantages.abs().mean()), "ratio_mean": float((values-old_log_probs).exp().mean().detach())}
 
 
 class ToyLM(nn.Module):
@@ -50,7 +59,7 @@ def main() -> None:
             dtype=torch.long,
         ),
     }
-    old_log_probs = torch.zeros(4)
+    old_log_probs = token_log_probs(model, batch)[0].detach()
     rewards = torch.tensor([0.0, -1.0, 0.0, 0.0])
 
     loss, metrics = grpo_safety_task_loss(

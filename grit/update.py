@@ -6,7 +6,7 @@ This module writes the optimizer-facing gradient:
 
 or, with curvature enabled:
 
-    final_grad = projected_task_grad + lambda_pres * (v - lr * H P v)
+    final_grad = projected_task_grad + lambda_pres * (v - lr * H Q v)
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ from grit.curvature import (
 )
 from grit.predictor import PredictorStepInfo, temporary_predictor_direction_step
 from grit.predictor import temporary_predictor_step
-from grit.projection import ProjectorBuildResult, default_module_filter
+from grit.projection import CompactProjector, ProjectorBuildResult, default_module_filter
 from grit.preservation_loss import PreservationLossResult
 
 
@@ -46,11 +46,12 @@ class GritUpdateConfig:
     learning_rate: float = 1e-6
     lambda_pres: float = 1.0
     use_curvature: bool = False
-    curvature_mode: str = "sam_fd"
-    sam_rho: float = 0.05
-    sam_normalize_direction: bool = True
+    curvature_mode: str = "central_fd"
+    fd_radius: float = 0.05
+    fd_normalize_direction: bool = True
     hvp_last_linear_layers: int = 0
     missing_projector: str = "identity"
+    projector_relaxation: float = 0.0
     zero_grad_before_write: bool = True
 
 
@@ -91,10 +92,11 @@ def _coerce_config(config: GritUpdateConfig | None, **overrides) -> GritUpdateCo
         "lambda_pres": config.lambda_pres,
         "use_curvature": config.use_curvature,
         "curvature_mode": config.curvature_mode,
-        "sam_rho": config.sam_rho,
-        "sam_normalize_direction": config.sam_normalize_direction,
+        "fd_radius": config.fd_radius,
+        "fd_normalize_direction": config.fd_normalize_direction,
         "hvp_last_linear_layers": config.hvp_last_linear_layers,
         "missing_projector": config.missing_projector,
+        "projector_relaxation": config.projector_relaxation,
         "zero_grad_before_write": config.zero_grad_before_write,
     }
     values.update({key: value for key, value in overrides.items() if value is not None})
@@ -124,6 +126,10 @@ def _autograd_gradient_map(
             gradient_map[name] = _zero_like_parameter(parameter)
         elif detach:
             gradient_map[name] = grad.detach().clone()
+        elif isinstance(raw_projector, CompactProjector):
+            basis_rank = raw_projector.basis.shape[1]
+            rank = float(raw_projector.dimension-basis_rank if raw_projector.complement else basis_rank)
+            nullity = float(raw_projector.dimension-rank)
         else:
             gradient_map[name] = grad.clone()
     return gradient_map
@@ -259,12 +265,13 @@ def assemble_grit_update(
     lambda_pres: float | None = None,
     use_curvature: bool | None = None,
     curvature_mode: str | None = None,
-    sam_rho: float | None = None,
-    sam_normalize_direction: bool | None = None,
+    fd_radius: float | None = None,
+    fd_normalize_direction: bool | None = None,
     parameters: Sequence[NamedParameter] | None = None,
     parameter_filter: ParameterFilter | None = None,
     module_filter: ModuleFilter | None = None,
     missing_projector: str | None = None,
+    projector_relaxation: float | None = None,
     hvp_last_linear_layers: int | None = None,
     zero_grad_before_write: bool | None = None,
 ) -> GritUpdateResult:
@@ -282,9 +289,10 @@ def assemble_grit_update(
         lambda_pres=lambda_pres,
         use_curvature=use_curvature,
         curvature_mode=curvature_mode,
-        sam_rho=sam_rho,
-        sam_normalize_direction=sam_normalize_direction,
+        fd_radius=fd_radius,
+        fd_normalize_direction=fd_normalize_direction,
         missing_projector=missing_projector,
+        projector_relaxation=projector_relaxation,
         hvp_last_linear_layers=hvp_last_linear_layers,
         zero_grad_before_write=zero_grad_before_write,
     )
@@ -292,19 +300,23 @@ def assemble_grit_update(
         raise ValueError(
             f"learning_rate must be non-negative, got {resolved.learning_rate}"
         )
+    if task_direction_fn is not None and resolved.use_curvature:
+        raise ValueError("Use grit.step.grit_step for optimizer-predictor curvature; this helper uses u=Q v")
     if resolved.lambda_pres < 0:
         raise ValueError(f"lambda_pres must be non-negative, got {resolved.lambda_pres}")
-    if resolved.curvature_mode != "sam_fd":
+    if resolved.curvature_mode != "central_fd":
         raise ValueError(
-            "curvature_mode must be 'sam_fd'; exact HVP is kept only for toy checks, "
+            "curvature_mode must be 'central_fd'; exact HVP is kept only for toy checks, "
             f"got {resolved.curvature_mode!r}"
         )
-    if resolved.sam_rho <= 0:
-        raise ValueError(f"sam_rho must be positive, got {resolved.sam_rho}")
+    if resolved.fd_radius <= 0:
+        raise ValueError(f"fd_radius must be positive, got {resolved.fd_radius}")
     if resolved.missing_projector not in {"identity", "zero"}:
         raise ValueError(
             f"missing_projector must be 'identity' or 'zero', got {resolved.missing_projector!r}"
         )
+    if not 0.0 <= resolved.projector_relaxation <= 1.0:
+        raise ValueError("projector_relaxation must be in [0, 1]")
     if resolved.hvp_last_linear_layers < 0:
         raise ValueError(
             f"hvp_last_linear_layers must be non-negative, got {resolved.hvp_last_linear_layers}"
@@ -328,6 +340,7 @@ def assemble_grit_update(
         parameters=parameters,
         module_filter=module_filter,
         missing=resolved.missing_projector,
+        relaxation=resolved.projector_relaxation,
     )
     if task_direction_fn is None:
         task_directions = {}
@@ -389,7 +402,7 @@ def assemble_grit_update(
             resolved.hvp_last_linear_layers,
         )
         if task_loss_fn is None:
-            raise ValueError("task_loss_fn is required when SAM-FD curvature is enabled")
+            raise ValueError("task_loss_fn is required when central difference curvature is enabled")
         from grit.curvature import finite_difference_curvature_corrected_preservation_gradients
 
         curvature_result = finite_difference_curvature_corrected_preservation_gradients(
@@ -399,12 +412,13 @@ def assemble_grit_update(
             preservation_gradients,
             projectors,
             learning_rate=resolved.learning_rate,
-            rho=resolved.sam_rho,
-            normalize_direction=resolved.sam_normalize_direction,
+            rho=resolved.fd_radius,
+            normalize_direction=resolved.fd_normalize_direction,
             parameters=parameters,
             hvp_parameters=hvp_parameters,
             module_filter=module_filter,
             missing_projector=resolved.missing_projector,
+            projector_relaxation=resolved.projector_relaxation,
         )
         preservation_correction = curvature_result.gradients
     else:
@@ -427,10 +441,11 @@ def assemble_grit_update(
         "grit/learning_rate": float(resolved.learning_rate),
         "grit/lambda_pres": float(resolved.lambda_pres),
         "grit/use_curvature": float(resolved.use_curvature),
-        "grit/curvature_mode_sam_fd": float(resolved.curvature_mode == "sam_fd"),
-        "grit/sam_rho": float(resolved.sam_rho),
-        "grit/sam_normalize_direction": float(resolved.sam_normalize_direction),
+        "grit/curvature_mode_central_fd": float(resolved.curvature_mode == "central_fd"),
+        "grit/fd_radius": float(resolved.fd_radius),
+        "grit/fd_normalize_direction": float(resolved.fd_normalize_direction),
         "grit/hvp_last_linear_layers": float(resolved.hvp_last_linear_layers),
+        "grit/projector_relaxation": float(resolved.projector_relaxation),
         "grit/hvp_parameter_count": float(len(hvp_parameters)),
         "grit/hvp_skipped": float(skipped_hvp),
         "grit/task_grad_norm": _squared_norm(list(task_gradients.values())) ** 0.5,

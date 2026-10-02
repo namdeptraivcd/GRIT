@@ -23,6 +23,7 @@ from grit.projection import build_projectors_from_covariances, collect_activatio
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-path", required=True, help="Hugging Face model path used as pi_base.")
+    parser.add_argument("--model-revision", help="Pinned base revision used for preservation generation")
     parser.add_argument("--dataset-path", required=True, help="Dataset name/path for D_pres.")
     parser.add_argument("--dataset-split", default="train", help="Dataset split to read.")
     parser.add_argument("--text-column", default="prompt", help="Column containing preservation prompts.")
@@ -62,6 +63,10 @@ def load_any_dataset(dataset_path: str, split: str):
 
 def make_batches(tokenizer, dataset, text_column: str, batch_size: int, max_length: int) -> Iterator[dict[str, torch.Tensor]]:
     def collate(rows):
+        if "input_ids" in rows[0]:
+            from scripts.preservation_data import stored_preservation_batch
+            ids, attention, _, _ = stored_preservation_batch(tokenizer, rows, max_length=max_length)
+            return {"input_ids": ids, "attention_mask": attention}
         texts = [row[text_column] for row in rows]
         return tokenizer(
             texts,
@@ -83,13 +88,14 @@ def main() -> None:
     output_path = Path(args.output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model_path, padding_side="left", trust_remote_code=args.trust_remote_code)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_path, revision=args.model_revision, padding_side="left", trust_remote_code=args.trust_remote_code)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
     print(f"[1/5] Loading model: {args.model_path}", flush=True)
     model = AutoModelForCausalLM.from_pretrained(
         args.model_path,
+        revision=args.model_revision,
         torch_dtype=dtype_from_name(args.dtype),
         trust_remote_code=args.trust_remote_code,
     ).to(args.device)
@@ -97,8 +103,14 @@ def main() -> None:
 
     print(f"[2/5] Loading preservation dataset: {args.dataset_path}", flush=True)
     dataset = load_any_dataset(args.dataset_path, args.dataset_split)
-    if args.text_column not in dataset.column_names:
+    revision = args.model_revision or getattr(model.config, "_commit_hash", None)
+    if not revision:
+        raise ValueError("Projector construction requires a pinned --model-revision")
+    if "base_revision" in dataset.column_names and set(dataset["base_revision"]) != {revision}:
+        raise ValueError("Projectors must use the preservation contexts' pinned base revision")
+    if "input_ids" not in dataset.column_names and args.text_column not in dataset.column_names:
         raise ValueError(f"Column {args.text_column!r} not found. Available columns: {dataset.column_names}")
+    has_original_prompts = "prompt" in dataset.column_names
 
     if args.max_samples > 0 and len(dataset) > args.max_samples:
         generator = torch.Generator().manual_seed(args.seed)
@@ -138,18 +150,25 @@ def main() -> None:
     )
 
     payload = {
-        "projectors": {name: result.projector for name, result in results.items()},
+        "projectors": {name: result.compact for name, result in results.items()},
         "metadata": {
             name: {
                 "threshold_value": result.threshold_value,
                 "nullity": result.nullity,
                 "rank": result.rank,
-                "diagnostics": projector_diagnostics(result.projector),
+                "diagnostics": projector_diagnostics(result.compact),
             }
             for name, result in results.items()
         },
         "args": vars(args),
+        "base_revision": revision,
     }
+    if Path(args.dataset_path).is_file():
+        from scripts.prepare_preservation_data import file_hash
+        payload["preservation_sha256"] = file_hash(Path(args.dataset_path))
+    if has_original_prompts:
+        from scripts.preservation_data import preservation_prompt_hashes
+        payload["projector_prompt_sha256"] = sorted(preservation_prompt_hashes(dataset))
     print(f"[5/5] Saving projectors to {output_path}", flush=True)
     torch.save(payload, output_path)
 

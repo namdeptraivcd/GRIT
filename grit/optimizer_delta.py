@@ -36,6 +36,7 @@ class AdamWDirectionPreconditioner:
     betas: tuple[float, float] = (0.9, 0.999)
     eps: float = 1e-8
     weight_decay: float = 0.0
+    state_device: str = "cpu"
 
     def __post_init__(self) -> None:
         self.state: dict[str, dict[str, torch.Tensor | int]] = {}
@@ -52,6 +53,7 @@ class AdamWDirectionPreconditioner:
             "betas": self.betas,
             "eps": self.eps,
             "weight_decay": self.weight_decay,
+            "state_device": self.state_device,
             "state": packed,
         }
 
@@ -59,56 +61,75 @@ class AdamWDirectionPreconditioner:
         self.betas = tuple(state_dict.get("betas", self.betas))  # type: ignore[assignment]
         self.eps = float(state_dict.get("eps", self.eps))
         self.weight_decay = float(state_dict.get("weight_decay", self.weight_decay))
+        self.state_device = str(state_dict.get("state_device", self.state_device))
         self.state = {}
         for name, state in state_dict.get("state", {}).items():
             self.state[name] = {
                 "step": int(state["step"]),
-                "exp_avg": state["exp_avg"].detach().clone(),
-                "exp_avg_sq": state["exp_avg_sq"].detach().clone(),
+                "exp_avg": state["exp_avg"].detach().to(self.state_device).clone(),
+                "exp_avg_sq": state["exp_avg_sq"].detach().to(self.state_device).clone(),
             }
 
     @torch.no_grad()
-    def directions(
-        self,
-        parameters: Sequence[NamedParameter],
-        gradients: Mapping[str, torch.Tensor],
-    ) -> dict[str, torch.Tensor]:
+    def prepare(self, parameters, gradients, *, derivative=False):
+        """Read pre-step state; return directions and optional diagonal da/dg.
+
+        Moment temporaries live for one tensor only. No state is committed here.
+        """
         beta1, beta2 = self.betas
-        updates: dict[str, torch.Tensor] = {}
+        directions, coefficients = {}, {}
         for name, parameter in parameters:
             grad = gradients[name].detach().to(device=parameter.device, dtype=torch.float32)
             state = self.state.get(name)
-            if state is None:
-                state = {
-                    "step": 0,
-                    "exp_avg": torch.zeros_like(parameter.detach(), dtype=torch.float32),
-                    "exp_avg_sq": torch.zeros_like(parameter.detach(), dtype=torch.float32),
-                }
-                self.state[name] = state
-
-            exp_avg = state["exp_avg"].to(device=parameter.device, dtype=torch.float32)
-            exp_avg_sq = state["exp_avg_sq"].to(device=parameter.device, dtype=torch.float32)
-            step = int(state["step"]) + 1
-
-            exp_avg.mul_(beta1).add_(grad, alpha=1.0 - beta1)
-            exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
-
-            bias_correction1 = 1.0 - beta1**step
-            bias_correction2 = 1.0 - beta2**step
-            denom = exp_avg_sq.sqrt().div_(bias_correction2**0.5).add_(self.eps)
-            adam_direction = exp_avg.div(bias_correction1).div(denom)
-            direction = adam_direction.neg()
-            if self.weight_decay != 0.0:
-                direction = direction.add(
-                    parameter.detach().to(torch.float32),
-                    alpha=-self.weight_decay,
+            step = 1 if state is None else int(state["step"]) + 1
+            old_m = torch.zeros_like(grad) if state is None else state["exp_avg"].to(grad)
+            old_s = torch.zeros_like(grad) if state is None else state["exp_avg_sq"].to(grad)
+            m = (beta1 * old_m + (1-beta1) * grad) / (1-beta1**step)
+            variance = (beta2 * old_s + (1-beta2) * grad.square()) / (1-beta2**step)
+            root = variance.sqrt()
+            denom = root + self.eps
+            directions[name] = (-m / denom - self.weight_decay * parameter.detach().float()).to(parameter)
+            if derivative:
+                first = ((1-beta1) / (1-beta1**step)) / denom
+                # At zero variance, old moments and g are zero in valid AdamW state;
+                # the limiting derivative of g/(abs(g)+eps) is 1/eps.
+                second = torch.where(
+                    root > 0,
+                    m * ((1-beta2) / (1-beta2**step)) * grad
+                    / (root.clamp_min(torch.finfo(root.dtype).tiny) * denom.square()),
+                    torch.zeros_like(root),
                 )
+                coefficients[name] = (first - second).to(self.state_device)
+        return directions, coefficients
 
-            updates[name] = direction.to(device=parameter.device, dtype=parameter.dtype)
-            state["step"] = step
-            state["exp_avg"] = exp_avg.detach()
-            state["exp_avg_sq"] = exp_avg_sq.detach()
-        return updates
+    @torch.no_grad()
+    def commit(self, parameters, gradients):
+        """Advance moments once, after the complete proposed update is validated."""
+        beta1, beta2 = self.betas
+        candidate_state = dict(self.state)
+        for name, parameter in parameters:
+            grad = gradients[name].detach().to(device=self.state_device, dtype=torch.float32)
+            state = self.state.get(name)
+            if state is None:
+                old_step = 0
+                exp_avg = torch.zeros_like(grad)
+                exp_avg_sq = torch.zeros_like(grad)
+            else:
+                old_step = int(state["step"])
+                exp_avg = state["exp_avg"].to(grad).clone()
+                exp_avg_sq = state["exp_avg_sq"].to(grad).clone()
+            exp_avg.mul_(beta1).add_(grad, alpha=1-beta1)
+            exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1-beta2)
+            candidate_state[name] = {
+                "step": old_step+1, "exp_avg": exp_avg, "exp_avg_sq": exp_avg_sq,
+            }
+        self.state = candidate_state
+
+    @torch.no_grad()
+    def directions(self, parameters, gradients):
+        directions, _ = self.prepare(parameters, gradients)
+        self.commit(parameters, gradients)
+        return directions
 
 
 @torch.no_grad()
@@ -121,6 +142,7 @@ def adamw_task_directions(
     task_preconditioner: AdamWDirectionPreconditioner,
     module_filter=None,
     missing_projector: str = "identity",
+    projector_relaxation: float = 0.0,
 ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor], dict[str, float]]:
     """Return signed AdamW task directions and their projected counterpart."""
 
@@ -135,6 +157,7 @@ def adamw_task_directions(
         parameters=parameters,
         module_filter=module_filter,
         missing=missing_projector,
+        relaxation=projector_relaxation,
     )
     task_before_norm = _squared_norm(task_directions.values()) ** 0.5
     task_after_norm = _squared_norm(projected_task_directions.values()) ** 0.5
@@ -162,6 +185,7 @@ def apply_grit_update(
     projected_task_directions: Mapping[str, torch.Tensor] | None = None,
     module_filter=None,
     missing_projector: str = "identity",
+    projector_relaxation: float = 0.0,
 ) -> dict[str, float]:
     """Apply one-LR projected task and raw preservation update.
 
@@ -180,6 +204,7 @@ def apply_grit_update(
             task_preconditioner=task_preconditioner,
             module_filter=module_filter,
             missing_projector=missing_projector,
+            projector_relaxation=projector_relaxation,
         )
     else:
         task_before_norm = _squared_norm(task_directions.values()) ** 0.5

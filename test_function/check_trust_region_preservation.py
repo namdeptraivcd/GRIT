@@ -1,129 +1,102 @@
 #!/usr/bin/env python3
-"""Toy sanity check for GRIT Phase 3 trust-region preservation."""
+"""Checks for fixed-base top-k+tail trust-region preservation."""
 
 from __future__ import annotations
 
 import sys
 from pathlib import Path
-
 import torch
+import torch.nn.functional as F
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from grit.preservation_loss import preservation_kl_loss
-from grit.trust_region import project_to_kl_ball, token_kl_from_logits
+from grit.trust_region import (
+    coarsened_policy_log_probs, kl_from_log_probs, log1mexp, project_to_kl_ball,
+)
 
 
-def main() -> None:
+def base_statistics(base_logits, k):
+    logp = F.log_softmax(base_logits, dim=-1)
+    ids = torch.topk(logp, k, dim=-1).indices
+    selected = torch.gather(logp, -1, ids)
+    tail = log1mexp(torch.logsumexp(selected, dim=-1))
+    return ids, selected, tail
+
+
+def main():
     torch.manual_seed(23)
+    base = torch.randn(2, 3, 7, dtype=torch.float64)
+    policy = (base+0.8*torch.randn_like(base)).requires_grad_(True)
+    full_kl = kl_from_log_probs(F.log_softmax(policy, -1), F.log_softmax(base, -1))
 
-    base_logits = torch.tensor(
-        [
-            [[5.0, 1.0, 0.0, -1.0, -2.0], [4.0, 0.0, -1.0, -2.0, -3.0]],
-            [[0.2, 0.1, 0.0, -0.1, -0.2], [3.0, 1.0, 0.0, -1.0, -2.0]],
-        ],
-        dtype=torch.float64,
+    previous = None
+    for k in (1, 3, 6, 7):
+        ids, base_logp, tail = base_statistics(base, k)
+        policy_logp = coarsened_policy_log_probs(policy, ids)
+        anchor = torch.cat((base_logp.float(), tail.float().unsqueeze(-1)), -1)
+        anchor = anchor-torch.logsumexp(anchor, -1, keepdim=True)
+        coarse_kl = kl_from_log_probs(policy_logp, anchor)
+        assert torch.all(coarse_kl <= full_kl.float()+2e-6)
+        if previous is not None:
+            assert coarse_kl.mean() >= previous.mean()-2e-6
+        previous = coarse_kl
+    torch.testing.assert_close(previous, full_kl.float(), atol=3e-6, rtol=3e-6)
+
+    ids, base_logp, tail = base_statistics(base, 3)
+    mask = torch.tensor([[True, True, False], [True, False, True]])
+    projection = project_to_kl_ball(
+        policy, epsilon=0.03, response_mask=mask, base_topk_ids=ids,
+        base_topk_log_probs=base_logp, base_log_tail=tail,
     )
-    policy_logits = base_logits.clone()
-    policy_logits[0, 0] = torch.tensor([5.1, 0.9, 0.0, -1.0, -2.0], dtype=torch.float64)
-    policy_logits[0, 1] = torch.tensor([-2.0, -1.0, 0.0, 1.0, 5.0], dtype=torch.float64)
-    policy_logits[1, 0] = torch.tensor([0.2, 0.1, 0.0, -0.1, -0.2], dtype=torch.float64)
-    policy_logits[1, 1] = torch.tensor([-2.0, -1.0, 0.0, 1.0, 4.0], dtype=torch.float64)
-    policy_logits.requires_grad_(True)
+    assert torch.all(projection.projected_kl[mask] <= 0.03+2e-6)
+    assert torch.all(projection.eta[~projection.violation_mask] == 0)
+    identical = project_to_kl_ball(
+        base, epsilon=0.03, response_mask=mask, base_topk_ids=ids,
+        base_topk_log_probs=base_logp, base_log_tail=tail,
+    )
+    assert torch.count_nonzero(identical.eta) == 0
 
-    responses = torch.tensor([[0, 3], [4, 4]])
-    response_mask = torch.tensor([[True, True], [False, True]])
-    epsilon = 0.05
-
+    # Eq. 9/10 gradient: hold the projected target fixed while perturbing logits.
+    one_policy = policy[:1, :1].detach().clone().requires_grad_(True)
+    one_ids, one_base, one_tail = ids[:1, :1], base_logp[:1, :1], tail[:1, :1]
     result = preservation_kl_loss(
-        policy_logits,
-        base_logits,
-        epsilon_pres=epsilon,
-        response_mask=response_mask,
-        selected_token_ids=responses,
-        top_k=1,
-        default_probability=1e-4,
+        one_policy, epsilon_pres=1e-5, response_mask=torch.ones(1, 1, dtype=torch.bool),
+        base_topk_ids=one_ids, base_topk_log_probs=one_base, base_log_tail=one_tail,
+        reduction="sum",
     )
-    projection = result.projection
-    sparse_raw_kl = projection.token_kl
-    dense_raw_kl = token_kl_from_logits(policy_logits, base_logits)
+    target = result.projection.projected_log_probs.detach()
+    expected_grad, = torch.autograd.grad(result.loss, one_policy)
 
-    accepted = (sparse_raw_kl <= epsilon + 1e-6) & response_mask
-    violating = (sparse_raw_kl > epsilon + 1e-6) & response_mask
-    active_projected_kl = projection.projected_kl[response_mask]
+    def fixed_target_loss(logits):
+        logp = coarsened_policy_log_probs(logits, one_ids)
+        return torch.sum(logp.exp()*(logp-target))
 
-    assert torch.all(result.token_loss[accepted] < 1e-10)
-    assert torch.all(result.token_loss[violating] > 1e-5)
-    assert torch.all(active_projected_kl <= epsilon + 1e-5)
-    assert projection.support_mask is not None
-    retained = projection.support_mask.gather(-1, responses.unsqueeze(-1)).squeeze(-1)
-    assert torch.all(retained[response_mask])
-    dropped_probs = projection.policy_log_probs.exp()[~projection.support_mask]
-    assert dropped_probs.numel() > 0
-    assert torch.all(dropped_probs > 0)
-    assert torch.all(projection.eta[violating] > 0)
-    assert not projection.eta.requires_grad
-    assert not projection.projected_log_probs.requires_grad
-    assert projection.policy_log_probs.requires_grad
+    radius = 1e-4
+    numerical = torch.zeros_like(one_policy)
+    for index in range(one_policy.shape[-1]):
+        plus, minus = one_policy.detach().clone(), one_policy.detach().clone()
+        plus[..., index] += radius
+        minus[..., index] -= radius
+        numerical[..., index] = (fixed_target_loss(plus)-fixed_target_loss(minus))/(2*radius)
+    torch.testing.assert_close(expected_grad, numerical, atol=3e-4, rtol=3e-3)
 
-    result.loss.backward()
-    assert policy_logits.grad is not None
-    assert torch.isfinite(policy_logits.grad).all()
-    assert policy_logits.grad.norm() > 0
-
-    dense_projection = project_to_kl_ball(policy_logits.detach(), base_logits, epsilon=epsilon)
-
-    token_mean_result = preservation_kl_loss(
-        policy_logits.detach(),
-        base_logits,
-        epsilon_pres=epsilon,
-        response_mask=response_mask,
-        selected_token_ids=responses,
-        top_k=1,
-        default_probability=1e-4,
-        reduction="token-mean",
+    full = preservation_kl_loss(policy, base, epsilon_pres=0.03, response_mask=mask, reduction="sum")
+    all_ids, all_base, all_tail = base_statistics(base, base.shape[-1])
+    top_v = preservation_kl_loss(
+        policy, epsilon_pres=0.03, response_mask=mask, base_topk_ids=all_ids,
+        base_topk_log_probs=all_base, base_log_tail=all_tail, reduction="sum",
     )
-    seq_lengths = response_mask.to(dtype=result.token_loss.dtype).sum(dim=-1)
-    manual_seq_loss = (
-        (result.token_loss.detach() * response_mask).sum(dim=-1) / seq_lengths.clamp_min(1.0)
-    )
-    manual_seq_loss = manual_seq_loss[seq_lengths > 0].mean()
-    torch.testing.assert_close(result.loss.detach(), manual_seq_loss, atol=1e-10, rtol=1e-10)
-    assert not torch.allclose(result.loss.detach(), token_mean_result.loss.detach())
+    torch.testing.assert_close(top_v.projection.token_kl, full.projection.token_kl, atol=3e-6, rtol=3e-6)
+    torch.testing.assert_close(top_v.loss, full.loss, atol=3e-6, rtol=3e-6)
 
-    fp16_policy_logits = policy_logits.detach().to(torch.float16).requires_grad_(True)
-    fp16_result = preservation_kl_loss(
-        fp16_policy_logits,
-        base_logits.to(torch.float16),
-        epsilon_pres=epsilon,
-        response_mask=response_mask,
-        selected_token_ids=responses,
-        top_k=1,
-        default_probability=1e-12,
-    )
-    assert torch.isfinite(fp16_result.loss)
-    assert torch.isfinite(fp16_result.token_loss).all()
-    assert torch.isfinite(fp16_result.projection.policy_log_probs).all()
-    fp16_result.loss.backward()
-    assert fp16_policy_logits.grad is not None
-    assert torch.isfinite(fp16_policy_logits.grad).all()
-
-    print(f"accepted_tokens={int(accepted.sum().item())}")
-    print(f"violating_tokens={int(violating.sum().item())}")
-    print(f"loss={result.loss.item():.8f}")
-    print(f"token_mean_loss={token_mean_result.loss.item():.8f}")
-    print("loss_reduction=seq-mean-token-mean")
-    print(f"max_dense_raw_kl={dense_raw_kl[response_mask].max().item():.8f}")
-    print(f"max_sparse_raw_kl={sparse_raw_kl[response_mask].max().item():.8f}")
-    print(f"max_projected_kl={active_projected_kl.max().item():.8f}")
-    print(f"max_eta={projection.eta[response_mask].max().item():.8f}")
-    print(f"projection_target_stopgrad=True")
-    print(f"dropped_default_probability={projection.default_probability:.1e}")
-    print(f"fp16_default_probability_finite={torch.isfinite(fp16_result.loss).item()}")
-    print(f"selected_tokens_retained={bool(torch.all(retained[response_mask]).item())}")
-    print(f"dense_projection_has_sparse_support={dense_projection.support_mask is not None}")
+    print("coarsened_kl_bounded=True")
+    print("top_v_matches_full=True")
+    print("projection_inside_ball=True")
+    print("eta_zero_when_feasible=True")
+    print("loss_gradient_finite_difference=True")
 
 
 if __name__ == "__main__":

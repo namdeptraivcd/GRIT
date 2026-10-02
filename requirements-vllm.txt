@@ -1,0 +1,3 @@
+# Linux/CUDA training environment. Let vLLM select its compatible torch build.
+-r requirements.txt
+vllm==0.15.1

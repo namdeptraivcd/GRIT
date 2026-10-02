@@ -1,572 +1,308 @@
-# GRIT Workflow Map
+# GRIT workflow
 
-This file is the source-of-truth map for changing or running this repository.
-Before editing a phase, check the relevant contract below and keep the artifact
-flow unchanged unless the proposal itself changes.
+This is the source of truth for the standalone trainer. Use `main.ipynb` for
+Modal or `scripts/run_grit_vllm.sh` on a single Linux GPU host. The prescribed
+run is a fresh 40-step run. Do not launch the paid run until it is explicitly
+authorized.
 
-## Current Goal
+## Runtime and pinned models
 
-Train Qwen2.5 on NSPO-style safety RL while preserving base-model capability:
+- Policy: [`Qwen/Qwen2.5-3B-Instruct`](https://huggingface.co/Qwen/Qwen2.5-3B-Instruct), commit
+  `aa8e72537993ba99e69dfaafa59ed015b17504d1`, 3,085,938,688 parameters.
+- Safety reward model: [`Qwen/Qwen3Guard-Gen-4B`](https://huggingface.co/Qwen/Qwen3Guard-Gen-4B), commit
+  `6ec42827da0c1ff11e7a49dc269d2e810d27e108`, 4,411,424,256 parameters.
+- Safety labels map as `Safe=0` and `Unsafe/Controversial=-1`. Missing or
+  ambiguous labels are retried and then fail with the accumulated parse-error
+  count. Metrics record parse errors, retries, and reward-model latency.
+- Actor weights and forwards are FP32. TF32 is disabled. Lower precision is
+  allowed only for vLLM rollout inference, the frozen-base statistics generated
+  during preparation, and the frozen safety model.
+- One persistent vLLM process owns a dedicated GPU. Rank zero exports the current
+  actor weights before every rollout, waits for the matching policy-version
+  acknowledgement, and requests generation only with that version. Prefix
+  caching is disabled.
+- Actor ranks use replicated weights and manual gradient synchronization. This is
+  a single-host NCCL backend, not FSDP, tensor parallelism, or optimizer sharding.
+  Projector application rejects a parameter whose last dimension is a local
+  shard. Unequal local microbatch counts are safe because backward does no
+  per-microbatch collective; one SUM all-reduce occurs at the end of each pass.
 
-```text
-D_task prompt
--> current policy rollout
--> safety model reward
--> clipped GRPO task gradient
--> GRIT gradient projection and preservation correction
--> one-LR manual GRIT update
--> checkpoint and optional Hub push
-```
+`modal_app.py` requests three A100-80GB GPUs: two actor ranks and one vLLM GPU.
+The shared container requests 256 GiB of host RAM for two copies of offloaded
+FP32 actor state. CUDA/vLLM
+compatibility and memory fit still require the real target hardware.
 
-Current smoke target:
+The Colab 0.5B notebook uses a separate pinned Qwen2.5-0.5B-Instruct policy
+(`7ae557604adf67be50417f59c2c2f167def9a775`, 494,032,768 parameters)
+and Qwen3Guard-Gen-0.6B reward model
+(`3706d237aa5d05ee7f6c8274c208a37211e9fd65`, 596,049,920 parameters).
+On a single A100-80GB, `--allow-colocated-rollout` permits one FP32 actor and
+the persistent vLLM process to share GPU 0. This exception is restricted to the
+small pinned profile; policy-version synchronization and frozen rollouts are
+unchanged. The task and preservation datasets, top-64 KL, projector construction,
+AdamW predictor, and central-difference correction follow the same workflow.
+The notebook saves complete checkpoints on Drive and resumes manually after a
+Colab interruption. Colocated GPU memory fit and run duration require an actual
+Colab run.
 
-Use the explicit NSPO-domain preservation path documented in
-[`docs/preservation_data.md`](docs/preservation_data.md). It samples AlpacaFarm,
-GSM8K and LeetCodeDataset, generates frozen-base response contexts, and uses the
-same context artifact for rebuilt projectors and response-level KL. The older
-PKU-SafeRLHF text-only preservation file remains supported for compatibility, but
-it is not the primary preservation artifact for this target.
-
-```text
-Task dataset:       PKU-Alignment/PKU-SafeRLHF, 11K task prompts
-Preserve prompts:   334 AlpacaFarm + 333 GSM8K + 333 LeetCodeDataset
-Preserve contexts:  data/preservation/qwen2_5_0_5b/preserve_contexts.parquet
-Policy/base model:  Qwen/Qwen2.5-0.5B-Instruct at one pinned revision
-Safety model:       Qwen/Qwen3Guard-Gen-0.6B
-Projectors:         rebuilt from the generated preservation contexts
-```
-
-## Repository Layout
-
-```text
-grit/                       Core GRIT math outside verl
-scripts/                    CLI entrypoints for data, projectors, smoke, train
-test_function/              Small focused checks for each algorithm piece
-config/method/grit.yaml     Default method knobs and ablations
-config/preservation/        Pinned preservation sources, counts, and seed
-agent_skills/               Phase-by-phase implementation cards
-verl/                       Vendored verl path with GRIT integration
-eval_benchmarks/            Evaluation utilities and benchmark runners
-data/                       Local/generated datasets, ignored by git
-artifacts/                  Local/generated projector files, ignored by git
-checkpoints/                Local/generated checkpoints, ignored by git
-```
-
-Generated Python caches are not part of the repo state:
+## Artifacts and data roles
 
 ```text
-__pycache__/
-.pytest_cache/
-*.pyc
-.DS_Store
+Task prompts -> current-policy vLLM rollout -> frozen rewards/advantages
+Projector prompts (1,000) -> frozen-base responses -> compact projectors
+KL prompts (6,000) -> frozen-base responses + stored base top-64 statistics
+Reserved evaluation prompts -> overlap check only
+GRIT update -> local checkpoint -> best-effort private Hub upload + metrics
 ```
 
-They can be deleted at any time.
+The projector set contains 334 general, 333 math, and 333 code prompts. The KL
+set contains 2,000 prompts from each domain. Sampling uses the pinned revisions
+in `config/preservation/`, hashes normalized prompts, and rejects overlap between
+the two sets. Training also requires a separate `--evaluation-file` and rejects
+normalized prompt overlap with either preservation set. The evaluation file must
+contain a nonempty `prompt` column. It is an external input and is not generated
+from the training sources by this repository.
 
-## Artifact Flow
+The KL sampler shuffles each domain, interleaves domains in a deterministic global
+order, and takes 48 rows per step without replacement until wrap. Its cursor,
+seed, corpus size, and stratification flag are saved in every checkpoint. At 48
+rows per step, one pass through 6,000 rows takes 125 steps; a 40-step run sees
+1,920 distinct rows, or 32% of the corpus. This is monitoring/training coverage
+for the sampled rows, not coverage of the full KL corpus.
 
-```mermaid
-flowchart TD
-    A["PKU-SafeRLHF"] --> B["scripts/prepare_grit_data.py"]
-    A2["AlpacaFarm + LeetCodeDataset + GSM8K"] --> B
-    B --> C["data/.../task_train.parquet"]
-    B --> L["legacy text-only preserve_1000.parquet"]
-    D["Pinned AlpacaFarm + GSM8K + LeetCodeDataset files"] --> E["prepare_preservation_data.py sample"]
-    E --> F["preserve_prompts.parquet"]
-    F --> G["prepare_preservation_data.py generate with frozen base"]
-    G --> H["preserve_contexts.parquet + manifest"]
-    H --> I["scripts/build_projectors.py"]
-    I --> J["artifacts/...projectors.pt"]
-    C --> K["scripts/train_grit_dpo.py"]
-    H --> K
-    J --> K
-    L -. "compatibility path" .-> K
-    M["Qwen2.5 policy and frozen base"] --> K
-    N["Qwen3Guard safety model"] --> K
-    K --> O["checkpoints/.../step_xxxxxx"]
-    O --> P["optional Hugging Face Hub push"]
-```
+Generated context artifacts retain exact token IDs, response boundaries,
+tokenizer fingerprint, prompt provenance, and base revision. Data, model caches,
+checkpoints, credentials, and runtime logs stay outside Git.
 
-Do not commit `data/`, `artifacts/`, or `checkpoints/`. They are runtime
-inputs/outputs.
+## GRPO task objective
 
-### Preservation Data Contract
-
-The reproducible NSPO-domain mix is configured in
-`config/preservation/nspo_mix.json`. Its engineering defaults are seed `66` and
-the `334/333/333` allocation above; they are not a claim that the exact NSPO
-sample list has been reconstructed.
-
-Preparation must satisfy all of these conditions:
+The trainer uses a token-ratio objective followed by a response mean:
 
 ```text
-- Read pinned, non-evaluation source files and retain source provenance.
-- Normalize and deduplicate prompts globally; fail if any domain quota is unmet.
-- Refuse to overwrite an existing output directory.
-- Write the final parquet and completion manifest only after a stage succeeds.
-- Retain contexts.partial.jsonl when generation is interrupted; resume is not supported.
+G = 5
+A_i = (reward_i - mean_group(reward)) / max(std_group(reward), 1e-6)
+ratio_i,t = exp(log_pi_theta(i,t) - frozen_old_log_prob(i,t))
+L_task = mean_over_responses mean_over_response_tokens
+         -min(ratio*A, clip(ratio, 1-e, 1+e)*A)
 ```
 
-Frozen-base generation must use one resolved base-model revision and its chat
-template. Each generated row stores exact `input_ids`, `response_start`,
-`response_mask`, the base model/revision, tokenizer fingerprint, and source
-metadata. Training must reject a tokenizer or base-revision mismatch and must
-reject truncation that removes every response token. Preservation KL is computed
-only over response tokens. The legacy text-only loader remains supported.
+Each step uses exactly 321 prompts and 1,605 responses, temperature 1, and
+`top_p=1`. With two ranks the prompt split is 161/160 and the response split
+is 805/800. Complete groups remain on one rank. The task sampler
+reshuffles at wrap: 34 complete steps consume 10,914 of 11,000 prompts and step
+35 is the first step that crosses the epoch boundary.
 
-## Task Objective
+Tokens, rewards, advantages, old log-probabilities, masks, and order are created
+once before any task backward and remain frozen for the entire logical step.
+Responses with zero advantage are omitted only from curvature probes; their
+normalization weight remains in the global denominator.
 
-For the NSPO-style GRPO safety path, `D_task` supplies prompts. Responses are
-sampled from the current policy:
+## Relaxed projector
+
+The artifact represents the hard null-space projector `P`. Every training use is
 
 ```text
-o_{i,g} ~ pi_theta(. | q_i)
+Q = P + gamma * (I - P), gamma = 0.05
 ```
 
-The safety model scores each `(prompt, response)` pair:
+on protected Linear weights and the identity on every unprotected parameter.
+`Q` acts on the full logical parameter vector. It is used for the task delta,
+`Qv` in the curvature direction, and the AdamW decay derivative. The preservation
+correction itself is not projected. `gamma=0` is the hard projector and
+`gamma=1` is identity.
+
+Projectors are serialized as `U U^T` or `I-U U^T`, choosing a basis for the
+smaller subspace. Qwen2.5-3B has `intermediate_size=11008`; one dense FP32
+`11008 x 11008` down-projector would occupy 484,704,256 bytes (484.7 MB, 462.25
+MiB). Compact application multiplies by the basis without constructing that
+dense matrix. Projector construction still needs each covariance and
+eigendecomposition during the offline preparation phase.
+
+## Fixed base top-64 trust region
+
+For every response-token position, preparation chooses the 64 most probable
+tokens under the frozen base model. It performs a teacher-forced Hugging Face
+forward with the same chat template and the configured preparation dtype; it
+does not reuse vLLM generation log-probabilities. Each row stores:
+
+- the fixed 64 token IDs;
+- their frozen-base log-probabilities;
+- the frozen-base log tail mass;
+- `base_top_k=64` and `base_statistics_dtype`.
+
+The manifest stores the same `k`, dtype, revision, and tokenizer fingerprint.
+Training requires `k=64` and rejects a row/manifest/CLI dtype mismatch. It does
+not load a second 3B frozen-base model, saving one 12.344 GB FP32 GPU copy.
+
+For current policy logits `z` and the fixed base set `S_t`:
 
 ```text
-r_{i,g} =  0   if response is safe
-r_{i,g} = -1   if response is unsafe
+log_Z = logsumexp(z over the full vocabulary)
+log p_i = z_i - log_Z, i in S_t
+log p_tail = log(1 - exp(logsumexp(log p_i, i in S_t)))
 ```
 
-Group-normalized advantage:
+The tail uses stable `log1mexp` and a finite floor. Gradient flows through the
+full-vocabulary `logsumexp`. The current policy and base therefore define a
+65-class distribution; the tail is retained and is never dropped or
+renormalized away. Raw predictor-to-base KL, geometric projection, eta search,
+projected target, loss, and gradient all use these 65 classes. The projected
+target is detached. Only next-token positions whose target is part of the stored
+response contribute; prompt and padding positions never contribute.
+
+The total-variation guarantee from Proposition 2 applies to this coarsened
+65-class distribution. It does not establish the same bound over individual
+full-vocabulary tail tokens.
+
+## Functional AdamW predictor and correction
+
+At fixed `theta_before`, with moments from the start of the step:
 
 ```text
-A_{i,g} = (r_{i,g} - mean_g r_{i,g}) / (std_g r_{i,g} + eps)
+m_new = beta1*m_old + (1-beta1)*g
+s_new = beta2*s_old + (1-beta2)*g^2
+m_hat = m_new / (1-beta1^step)
+s_hat = s_new / (1-beta2^step)
+D = sqrt(s_hat) + eps
+a(g) = m_hat / D
+delta_raw = -lr * (a(g) + wd*theta_before)
+Delta_task = Q delta_raw
+B = (1-beta1)/((1-beta1^step)*D)
+    - m_hat*(1-beta2)*g / ((1-beta2^step)*sqrt(s_hat)*D^2)
 ```
 
-Clipped GRPO minimization loss without an extra task KL:
+The zero-variance branch uses the finite limiting derivative. No
+`optimizer.step()` is called, no task graph is retained across phases, and no
+gradient clipping is implemented. Moments are formed from the unprojected task
+gradient. They are committed exactly once after the complete candidate update is
+finite and installed successfully.
 
-```text
-L_task = - mean_{i,g} min(
-    rho_{i,g} A_{i,g},
-    clip(rho_{i,g}, 1-epsilon, 1+epsilon) A_{i,g}
-)
+One logical step is:
 
-rho_{i,g} = pi_theta(o_{i,g} | q_i) / pi_old(o_{i,g} | q_i)
-```
+1. Accumulate task losses one response at a time. Each loss is divided by the
+   global 1,605-response denominator. Move `p.grad` ownership into an FP32 tensor,
+   clear `p.grad`, and SUM-reduce once.
+2. Form the functional AdamW direction and `Delta_task`. Save `theta_before` by
+   FP32 CPU copy. Never restore by subtracting a rounded delta.
+3. Set `theta_pred=theta_before+Delta_task`. Accumulate 48 response-only KL
+   losses, divided by the global valid response-token count, and SUM-reduce `v`.
+4. Restore `theta_before`. If `v=0` globally, accept the cached task delta and
+   skip curvature. This is expected while all tokens are within the KL ball.
+5. Form `Qv`; update `c = v - lr*wd*Qv`; then reuse the `Qv` buffer in place as
+   `u = B elementwise-multiplied-by Qv`. If `u=0`, retain the first-order and decay
+   terms and skip the HVP.
+6. With `r=rho/||u||`, run the same frozen task batch sequentially at
+   `theta_before+r*u` and `theta_before-r*u`. Restore the same RNG before both
+   passes. Accumulate the negative minus loss into the same gradient buffer, then
+   perform one SUM all-reduce:
 
-If all rewards inside a prompt group are identical, the group advantage is zero
-and that group contributes no task gradient. This is expected GRPO behavior.
+   ```text
+   Hu = (g_plus - g_minus)/(2*r) = (g_plus-g_minus)*||u||/(2*rho)
+   ```
 
-## Phase Contracts
+7. Apply `c -= lr*Hu`, validate every candidate, install
+   `theta_next = theta_before + Delta_task - lr*lambda_pres*c`, and commit AdamW
+   state once. Any exception restores weights and leaves optimizer state
+   unchanged.
 
-### Phase 1: Null-Space Gradient Projection
+Scheduled diagnostic steps also compare central differences at `rho` and
+`2*rho`, and compare the central estimate with a one-sided estimate. These extra
+passes replay the same frozen batch and RNG and do not affect the update.
 
-Build projectors from preservation activations:
+## Memory at 3B
 
-```text
-P = U_null U_null^T
-```
+For 3,085,938,688 parameters, one full FP32 vector is 12,343,754,752 bytes =
+12.344 GB = 11.496 GiB. The implementation offloads long-lived AdamW moments,
+the saved pre-step weights, the task gradient used for commit, derivative
+coefficients, and diagnostic reference HVPs to CPU. It moves one parameter tensor
+at a time back to the actor GPU when needed.
 
-The current training entrypoint converts the task gradient into an AdamW-shaped
-direction without a learning rate, then projects only that direction for
-protected Linear weights:
+| Phase | Full-size actor-GPU vectors at the transient peak | FP32 vector bytes |
+| --- | --- | ---: |
+| Task accumulation | weights, accumulated task gradient | 24.69 GB |
+| Predictor projection | weights, task gradient, raw direction, projected delta | 49.38 GB |
+| KL backward | weights, cached delta, preservation gradient | 37.03 GB |
+| Curvature | weights, cached delta, correction, in-place `u`, HVP buffer | 61.72 GB |
+| Final candidate | weights, cached delta, correction, one parameter temporary | about 37.03 GB plus one tensor |
 
-```text
-direction_task <- AdamW_direction(grad_task)
-term_task_W <- direction_task_W @ P
-```
+The per-rank CPU peak can include the old and candidate moments during the atomic
+commit, saved weights, task gradient, and the 4B safety model: about 82.9 GB
+(77.2 GiB). Two actor processes can therefore approach 154.4 GiB before Python,
+vLLM, staging, and allocator overhead; the Modal request is 256 GiB. Compact
+projector bases, activations, logits,
+CUDA workspaces, and fragmentation are additional GPU memory. The estimates show
+why dense projectors and GPU-resident optimizer state are not viable; they do not
+prove that the real 80 GB run fits.
 
-Preservation remains an unprojected raw correction with no optimizer state:
+The trainer logs the fraction of FP32 coordinates changed by the predictor and
+probe and the fraction of those changes lost after FP16 or BF16 casting. It
+raises an early-stop error if the predictor or a required probe is bit-identical
+to `theta_before` in FP32.
 
-```text
-W <- W + lr * (term_task - lambda_pres * correction)
-```
+On the first step, before applying the predictor, the actor measures mean and
+maximum response-token KL from its FP32 base weights to the stored fixed-base
+top-64 plus tail statistics. A maximum above one tenth of `epsilon_pres` raises
+`base_anchor_precision_floor` in the metrics. This measures the anchor mismatch
+introduced by lower-precision offline base forwards and any implementation
+differences; it does not alter the update.
 
-Only `AdamW_task` keeps moment state. The training loop does not call a final
-`optimizer.step()` because the two additive deltas are applied manually.
+## Fresh run, checkpoints, and failure behavior
 
-Do not use NSPO's periodic weight repair as the primary GRIT mechanism:
+The notebook contains no smoke launch and no resume launch. It starts from the
+pinned base in a new output directory for 40 steps. Before allocating the
+training models, rank zero requires a token from the configured environment
+variable, a Hub repository ID, and a successful Hugging Face identity check.
+The token is passed directly to the client and is never written to arguments,
+metrics, or logs.
 
-```text
-W <- W_base + (W - W_base) @ P
-```
+A checkpoint is complete only after model, tokenizer, config, local
+`training.pt`, sampler state, and `complete.json` are written. The optimizer file
+stays local. After local completion, rank zero attempts a private Hub upload that
+excludes `training.pt`; upload errors are recorded in metrics and do not terminate
+training. Existing resume support remains for manual recovery, but it is not part
+of the prescribed launch or acceptance procedure.
 
-Main files:
+NaN/Inf, CUDA OOM, and FP32 predictor/probe resolution failures stop with a clear
+message. A failed logical step does not advance samplers, write metrics, mutate
+AdamW state, or leave partial actor weights.
 
-```text
-grit/projection.py
-scripts/build_projectors.py
-verl/verl/experimental/grit/projector.py
-verl/verl/workers/fsdp_workers.py
-verl/verl/workers/actor/dp_actor.py
-```
+## Metrics
 
-### Phase 2: Predictor Theta Tilde
+`tqdm` shows current/total steps, elapsed time, ETA, reward, main norms, KL
+violation rate, and rollout/reward/task/predictor/preservation/curvature/update times.
+Each committed step appends to `metrics.jsonl`; `diagnostics_summary.json` is
+atomically replaced.
 
-Temporarily move to the point after the projected task step. In the current
-one-LR path this is the signed optimizer direction that will actually be applied:
+Metrics include task/raw/projected/final norms, `g^TQg/||g||^2`, hard-subspace
+leakage, raw 65-class KL mean/p95/max and per-domain values, token and context
+violation rates, eta mean/p95/max, top-64 base coverage mean/p5, preservation
+activation, central/one-sided and `rho`/`2rho` agreement, precision-loss
+fractions, response tokens/second, reward latency, parse errors/retries, unsafe
+fraction, zero-advantage groups, phase times, and peak allocated actor VRAM.
+Coverage raises an alert when the p5 base mass is below 0.9.
 
-```text
-direction_task = AdamW_direction(grad_task)
-term_task = project(direction_task)
-theta_tilde = theta + lr * term_task
-```
+The projector artifact does not retain the original activation matrix `K` or its
+singular values. `task_delta_outside_null_norm` is an orthonormal subspace leakage
+proxy; it is not the requested weighted `||Delta W K||`. Exact logging of that
+quantity requires adding a compact activation factor to the artifact and paying
+its storage and runtime cost.
 
-Forward preservation data at `theta_tilde`, then restore `theta`. For generated
-contexts, reuse the stored token IDs and response mask rather than retokenizing
-the decoded text. This must not call `optimizer.step()` and must not leave
-parameters changed.
+## Verification
 
-Main files:
-
-```text
-grit/predictor.py
-verl/verl/experimental/grit/predictor.py
-```
-
-`temporary_predictor_step` must support:
-
-```text
-preserve_autograd_graph: bool = False
-```
-
-This keeps Phase 4 HVP possible when enabled.
-
-### Phase 3: Trust-Region Preservation
-
-Preservation is anchored to the frozen base policy, not the rollout policy:
-
-```text
-KL(pi_tilde(. | q, o_<t) || pi_base(. | q, o_<t)) <= epsilon_pres
-```
-
-If a token violates the bound, project toward `pi_base` and train against the
-detached projected distribution:
-
-```text
-L_pres = KL(pi_tilde || stopgrad(pi_proj))
-```
-
-For generated preservation contexts, evaluate this loss only where the shifted
-response mask is active. Padding and prompt tokens must never contribute to the
-preservation loss. Text-only preservation data uses the legacy all-token mask.
-
-Main files:
-
-```text
-grit/trust_region.py
-grit/preservation_loss.py
-verl/verl/experimental/grit/preservation.py
-verl/verl/workers/actor/dp_actor.py
-```
-
-### Phase 4: Optional Curvature
-
-Full proposal correction:
-
-```text
-preservation_correction = v - lr * H_task P v
-```
-
-where:
-
-```text
-v = grad_{theta_tilde} L_pres(theta_tilde)
-H_task u = grad_theta <grad_theta L_task(theta), u>
-u = P v
-```
-
-Do not build a full Hessian. When `--use-curvature` is enabled, the training
-workflow uses SAM-style finite difference only:
-
-```text
-H_task u ~= (grad_task(theta + rho * u / ||u||) - grad_task(theta)) * ||u|| / rho
-```
-
-The exact autograd HVP helper is kept only for toy correctness checks. Real
-training does not expose an exact-HVP backend.
-
-Main files:
-
-```text
-grit/curvature.py
-grit/update.py
-test_function/check_hvp.py
-test_function/check_grpo_curvature_update.py
-```
-
-### Phase 5: One-LR Update
-
-First-order default:
-
-```text
-direction_task = AdamW_direction(grad_task)
-term_task = project(direction_task)
-W <- W + lr * (term_task - lambda_pres * v)
-```
-
-With curvature:
-
-```text
-preservation_correction = v - lr * H_task P v
-W <- W + lr * (term_task - lambda_pres * preservation_correction)
-```
-
-Curvature ablation:
-
-```text
-update_direction = term_task - lambda_pres * (v - lr * H_task P v)
-```
-
-`lr` is multiplied once, after the task and preservation directions are combined.
-
-Main files:
-
-```text
-grit/update.py
-scripts/train_grit_dpo.py
-verl/verl/workers/actor/dp_actor.py
-config/method/grit.yaml
-```
-
-## Training Entrypoints
-
-### Projection-only verl / Kaggle T4 x 2
-
-`scripts/run_grit_vllm.sh` runs one FSDP1 actor plus vLLM rollout on GPU 0 and
-Qwen3Guard on GPU 1. Its zero-preservation branch uses `ProjectedAdamW` in
-`verl/verl/experimental/grit/optimizer.py`: update moments from unprojected,
-unscaled/clipped task gradients, form the signed AdamW direction (including any
-decay), right-project protected weights, and apply the learning rate once.
-The legacy preservation-enabled actor branch remains separate.
-
-This backend requires FP32 master parameters, `use_orig_params=true`, and one
-actor GPU; it rejects multi-rank/flattened projection instead of applying a
-local-shard projector. FP16 autocast + GradScaler supports T4. Zero-advantage
-batches skip optimizer/moment updates. Nonfinite gradients skip the update;
-the policy-version counter and LR scheduler advance only on accepted updates.
-Optimizer moments/version use the normal verl optimizer checkpoint; GradScaler
-state is saved with RNG/scheduler in the extra checkpoint and restored on resume.
-
-The data adapter retains `extra_info.raw_prompt` and the batch reward schema.
-Qwen3Guard receives the original prompt plus current rollout response through
-its official tokenizer template; Safe=0, Unsafe/Controversial=-1. Missing or
-ambiguous Safety/Refusal labels retry a bounded number of times and then fail.
-Reward metrics include parse errors, request errors, refusal rate and latency.
-Policy rollout log-probs are retained for a pre-update comparison against the
-PyTorch actor. The PPO denominator stays frozen for the rollout batch.
-
-The runner accepts Hydra overrides at the end, including resume settings:
+Run only CPU checks until the paid run is authorized:
 
 ```bash
-ACTOR_GPU=0 GUARD_GPU=1 MAX_STEPS=3 SAVE_STEPS=1 \
-bash scripts/run_grit_vllm.sh \
-  trainer.resume_mode=resume_path \
-  trainer.resume_from_path=/path/to/global_step_2
+python -m pytest -q
+python test_function/check_trust_region_preservation.py
+python test_function/check_projection.py
+bash -n scripts/*.sh
+python scripts/train_grit.py --help
 ```
 
-Use prepared bundle paths for `TASK_FILE`, `VAL_FILE` and `PROJECTORS_PATH`.
-Do not pass preservation contexts as a runtime preservation dataset. The
-training notebook validates bundle identity, runs smoke/resume, reloads the
-final model and can upload it to the user-configured Hub destination.
-After committing and pushing these files, set the notebook `REPO_REF` to that
-new commit SHA. CPU regression checks do not establish GPU/vLLM compatibility;
-Kaggle install, memory, rollout sync and FP16 smoke must still pass.
-
-```bash
-PYTHONPATH=.:verl python -m pytest -q \
-  test_function/test_projection_only_backend.py verl/tests/experimental/grit
-```
-
-Prepare the pinned 1,000-prompt NSPO-domain pool:
-
-```bash
-python scripts/prepare_preservation_data.py sample
-```
-
-Generate frozen-base contexts. Start with the short smoke command in
-`docs/preservation_data.md`, then run the complete artifact:
-
-```bash
-python scripts/prepare_preservation_data.py generate \
-  --prompts data/preservation/nspo_mix/preserve_prompts.parquet \
-  --output-dir data/preservation/qwen2_5_0_5b \
-  --model-path Qwen/Qwen2.5-0.5B-Instruct \
-  --max-prompt-length 2048 \
-  --max-new-tokens 256
-```
-
-Use the resolved model revision recorded in the generation manifest for the
-projector builder and trainer. Rebuild projectors from the generated contexts:
-
-```bash
-scripts/run_build_projectors.sh \
-  --model-path Qwen/Qwen2.5-0.5B-Instruct \
-  --dataset-path data/preservation/qwen2_5_0_5b/preserve_contexts.parquet \
-  --text-column text \
-  --max-length 2304 \
-  --output-path <new-projector-artifact>
-```
-
-Run first-order GRIT with GRPO safety:
-
-```bash
-TASK_OBJECTIVE=grpo_safety \
-SAFETY_MODEL_PATH="Qwen/Qwen3Guard-Gen-0.6B" \
-PRESERVE_FILE="data/preservation/qwen2_5_0_5b/preserve_contexts.parquet" \
-PROJECTORS_PATH="<new-projector-artifact>" \
-GRPO_GENERATIONS=4 \
-ROLLOUT_TEMPERATURE=1.0 \
-ROLLOUT_TOP_P=0.98 \
-MAX_STEPS=50 \
-SAVE_STEPS=50 \
-METRIC_WINDOW=20 \
-EVAL_SAMPLES=16 \
-EVAL_GENERATIONS=1 \
-EVAL_STEPS=50 \
-EVAL_OUTPUT_FILE="checkpoints/grit_qwen2_5_0_5b/fixed_eval.jsonl" \
-NPROC_PER_NODE=1 \
-bash scripts/run_kaggle_grit_train.sh \
-  --model-revision <base_revision-from-generation-manifest> \
-  --max-preserve-length 2304 \
-  --lr 5e-7 \
-  --lambda-pres 0.1 \
-  --epsilon-pres 1e-3
-```
-
-The generated context and projector must come from the same preservation corpus,
-and the policy/base revision must match the generation manifest. A 2,304-token
-preservation budget can use substantially more memory than the 256-token legacy
-smoke path. To exercise compatibility instead, explicitly set `PRESERVE_FILE` to
-the legacy `data/grit_qwen2_5_0_5b/preserve_1000.parquet` artifact and use its
-matching projectors.
-
-The standard curvature workflow uses SAM-FD. Run it with the task batch size
-and preservation batch size stated explicitly:
-
-```bash
-CURVATURE_BACKEND=sam_fd \
-SAM_RHO=0.05 \
-bash scripts/run_kaggle_grit_train.sh \
-  --use-curvature \
-  --task-batch-size 16 \
-  --preserve-batch-size 1
-```
-
-`SAM_RHO=0.05` controls the finite-difference perturbation radius.
-
-Use very small settings for Phase 4 smoke on T4:
-
-```text
-MAX_STEPS=1
-GRPO_GENERATIONS=2
-```
-
-## Metrics To Watch
-
-Batch metrics:
-
-```text
-reward              current batch mean reward
-unsafe              current batch unsafe fraction
-task                current batch task loss
-pres                current batch preservation loss
-kl                  current batch preservation violation fraction
-grad                current final gradient norm
-hvp                 SAM-FD HVP approximation norm, zero when curvature is disabled
-hvp_skip            1 when HVP is skipped
-curv                curvature backend shown in tqdm: sam or off
-```
-
-Run-average metrics:
-
-```text
-reward_avg          mean reward from start of run
-unsafe_avg          mean unsafe fraction from start of run
-pres_avg            mean preservation loss from start of run
-grad_avg            mean final gradient norm from start of run
-```
-
-Rolling metrics are saved in checkpoint state as:
-
-```text
-roll20_reward_mean
-roll20_unsafe_fraction
-roll20_pres_loss
-roll20_grad
-```
-
-Fixed eval metrics use the same fixed prompts across the run:
-
-```text
-fixed_eval step=0    baseline before training
-fixed_eval step=N    eval after optimizer step N
-eval_reward_mean     mean fixed-eval reward, 0 is safer than -1
-eval_unsafe_fraction fixed-eval unsafe fraction
-```
-
-Decision rule for early experiments:
-
-```text
-reward_avg should move toward 0
-unsafe_avg should decrease
-grad must stay finite
-pres/kl should not explode
-```
-
-## Checks Before Running Long Jobs
-
-Run local checks:
-
-```bash
-/Users/apple/miniconda3/envs/grit-qwen3/bin/python test_function/check_projection.py
-/Users/apple/miniconda3/envs/grit-qwen3/bin/python test_function/check_preservation_data.py
-/Users/apple/miniconda3/envs/grit-qwen3/bin/python test_function/check_predictor_restore.py
-/Users/apple/miniconda3/envs/grit-qwen3/bin/python test_function/check_trust_region_preservation.py
-/Users/apple/miniconda3/envs/grit-qwen3/bin/python test_function/check_total_update.py
-/Users/apple/miniconda3/envs/grit-qwen3/bin/python test_function/check_hvp.py
-/Users/apple/miniconda3/envs/grit-qwen3/bin/python test_function/check_grpo_safety_objective.py
-/Users/apple/miniconda3/envs/grit-qwen3/bin/python test_function/check_grpo_curvature_update.py
-```
-
-Run verl integration checks:
-
-```bash
-PYTHONPATH=/Users/apple/tower-challenge/GRIT:/Users/apple/tower-challenge/GRIT/verl \
-/Users/apple/miniconda3/envs/grit-qwen3/bin/python -m pytest -q \
-  /Users/apple/tower-challenge/GRIT/verl/tests/experimental/grit
-```
-
-On Colab, verify file sync before training:
-
-```python
-import inspect
-from grit.predictor import temporary_predictor_step
-
-print(inspect.signature(temporary_predictor_step))
-```
-
-The signature must include:
-
-```text
-preserve_autograd_graph: bool = False
-```
-
-## Change Discipline
-
-When changing a phase:
-
-```text
-1. Read this WORKFLOW.md.
-2. Read the matching agent_skills/phase_*.md.
-3. Change the smallest file surface for that phase.
-4. Add or update a test_function check.
-5. Run the focused check and the verl integration check if actor behavior changed.
-6. Sync changed files to Drive if Colab is the execution target.
-7. Do not mix Phase 4 curvature changes into metric/debug-only changes.
-```
-
-When syncing to Google Drive, preserve the local structure exactly:
-
-```text
-local: GRIT/grit/predictor.py
-drive: GRIT/grit/predictor.py
-
-local: GRIT/verl/verl/workers/actor/dp_actor.py
-drive: GRIT/verl/verl/workers/actor/dp_actor.py
-```
-
-Avoid archives unless explicitly requested.
+The checks cover global response normalization, unequal local counts, zero and
+nonzero preservation branches, functional AdamW including nonzero moments and
+weight decay, relaxed `Q`, central differences, clipping-boundary probes, RNG and
+weight restoration, single state commit, distributed reduction, stale rollout
+versions, reward parsing retries, compact projector serialization, split-data
+provenance, and fixed base top-64 plus tail math. CPU checks do not establish CUDA
+compatibility, end-to-end throughput, GPU memory fit, or successful Hub upload.

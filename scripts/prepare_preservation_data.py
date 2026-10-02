@@ -16,14 +16,14 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 try:
-    from scripts.preservation_data import preservation_prompt_ids, sample_source, tokenizer_fingerprint
+    from scripts.preservation_data import preservation_prompt_hashes, preservation_prompt_ids, sample_source, tokenizer_fingerprint
 except ModuleNotFoundError as exc:
     # When this file is invoked as `python scripts/prepare_preservation_data.py`,
     # Python puts `scripts/` (not the repository root) first on sys.path.
     # Fall back to the sibling module while preserving unrelated import errors.
     if exc.name != "scripts.preservation_data":
         raise
-    from preservation_data import preservation_prompt_ids, sample_source, tokenizer_fingerprint
+    from preservation_data import preservation_prompt_hashes, preservation_prompt_ids, sample_source, tokenizer_fingerprint
 
 
 def file_hash(path: Path) -> str:
@@ -66,9 +66,13 @@ def sample(args) -> None:
     from huggingface_hub import hf_hub_download
 
     config = json.loads(args.config.read_text(encoding="utf-8"))
+    exclude = getattr(args, "exclude_prompts", None)
+    if config.get("purpose") == "monitor" and not exclude:
+        raise ValueError("KL monitoring sampling requires --exclude-prompts for the projector corpus")
+    seen = preservation_prompt_hashes(read_rows(exclude)) if exclude else set()
     output = args.output_dir
     output.mkdir(parents=True, exist_ok=False)
-    seen, rows, sources = set(), [], []
+    rows, sources = [], []
     for source in config["sources"]:
         print(f"Loading {source['repo_id']} / {source['split']}", flush=True)
         path = Path(hf_hub_download(
@@ -84,9 +88,52 @@ def sample(args) -> None:
     )
     finish_output(output, rows, {
         "stage": "prompts_only", "seed": config["seed"], "sources": sources,
+        "purpose": config.get("purpose", "projector"),
+        "excluded_prompts_sha256": file_hash(exclude) if exclude else None,
         "sampling": "per-domain shuffled rows, global normalized prompt deduplication",
         "nspo_note": "Source families match NSPO citations; splits and ratios are GRIT choices.",
     }, "preserve_prompts.parquet")
+
+
+def topk_statistics(logits, k: int):
+    """Base top-k log-probabilities plus a stable tail from full-vocabulary logits."""
+    import torch
+    from grit.trust_region import log1mexp
+
+    compute = logits.float()
+    values, ids = torch.topk(compute, min(k, compute.shape[-1]), dim=-1)
+    top_log_probs = values-torch.logsumexp(compute, dim=-1, keepdim=True)
+    tail = log1mexp(torch.logsumexp(top_log_probs, dim=-1))
+    return ids, top_log_probs, tail
+
+
+def teacher_forced_base_statistics(model, sequence: list[int], response_start: int, k: int, device: str):
+    """Compute fixed base statistics without materializing sequence x vocabulary logits."""
+    import torch
+
+    prefix = torch.tensor([sequence[:response_start]], dtype=torch.long, device=device)
+    ids_rows, logp_rows, tail_rows = [], [], []
+    with torch.inference_mode():
+        output = model(input_ids=prefix, attention_mask=torch.ones_like(prefix), use_cache=True)
+        logits = output.logits[:, -1]
+        past = output.past_key_values
+        ids, logp, tail = topk_statistics(logits, k)
+        ids_rows.append(ids[0].cpu())
+        logp_rows.append(logp[0].cpu())
+        tail_rows.append(tail[0].cpu())
+        for offset, token in enumerate(sequence[response_start:-1], start=1):
+            current = torch.tensor([[token]], dtype=torch.long, device=device)
+            attention = torch.ones((1, response_start+offset), dtype=torch.long, device=device)
+            output = model(input_ids=current, attention_mask=attention, past_key_values=past, use_cache=True)
+            past = output.past_key_values
+            ids, logp, tail = topk_statistics(output.logits[:, -1], k)
+            ids_rows.append(ids[0].cpu())
+            logp_rows.append(logp[0].cpu())
+            tail_rows.append(tail[0].cpu())
+    return (
+        torch.stack(ids_rows).tolist(), torch.stack(logp_rows).tolist(),
+        torch.stack(tail_rows).tolist(),
+    )
 
 
 def generate(args) -> None:
@@ -107,7 +154,7 @@ def generate(args) -> None:
         tokenizer.pad_token = tokenizer.eos_token
     fingerprint = tokenizer_fingerprint(tokenizer)
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-    dtype = torch.float16 if device.startswith("cuda") else torch.float32
+    dtype = getattr(torch, args.dtype)
     model = AutoModelForCausalLM.from_pretrained(
         args.model_path, revision=revision, torch_dtype=dtype, attn_implementation="eager",
     ).to(device).eval()
@@ -132,6 +179,9 @@ def generate(args) -> None:
             response_ids = sequence[len(prompt_ids):]
             if not response_ids:
                 raise ValueError(f"{row['id']}: empty generated response")
+            topk_ids, topk_log_probs, log_tail = teacher_forced_base_statistics(
+                model, sequence, len(prompt_ids), args.top_k, device,
+            )
             record = {
                 **row,
                 "text": tokenizer.decode(sequence, skip_special_tokens=False),
@@ -142,6 +192,11 @@ def generate(args) -> None:
                 "tokenizer_sha256": fingerprint,
                 "base_model": args.model_path,
                 "base_revision": revision,
+                "base_topk_ids": topk_ids,
+                "base_topk_log_probs": topk_log_probs,
+                "base_log_tail": log_tail,
+                "base_top_k": args.top_k,
+                "base_statistics_dtype": str(dtype).removeprefix("torch."),
             }
             generated.append(record)
             stream.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -151,6 +206,8 @@ def generate(args) -> None:
         "stage": "base_contexts", "base_model": args.model_path, "base_revision": revision,
         "tokenizer_sha256": fingerprint, "seed": args.seed, "do_sample": False,
         "max_prompt_length": args.max_prompt_length, "max_new_tokens": args.max_new_tokens,
+        "base_top_k": args.top_k, "base_statistics_dtype": str(dtype).removeprefix("torch."),
+        "base_statistics": "teacher-forced HF forward; fixed base top-k plus tail",
         "input_sha256": file_hash(args.prompts),
     }, "preserve_contexts.parquet")
     (output / "contexts.partial.jsonl").rename(output / "contexts.jsonl")
@@ -163,19 +220,23 @@ def main() -> None:
     sampling.add_argument("--config", type=Path, default=REPO_ROOT / "config/preservation/nspo_mix.json")
     sampling.add_argument("--output-dir", type=Path, default=REPO_ROOT / "data/preservation/nspo_mix")
     sampling.add_argument("--cache-dir", default=str(REPO_ROOT / ".cache/huggingface"))
+    sampling.add_argument("--exclude-prompts", type=Path,
+                          help="Exclude normalized prompts from this projector corpus when sampling KL data")
     generation = commands.add_parser("generate")
     generation.add_argument("--prompts", type=Path, required=True)
     generation.add_argument("--output-dir", type=Path, required=True)
-    generation.add_argument("--model-path", default="Qwen/Qwen2.5-0.5B-Instruct")
-    generation.add_argument("--revision", default="main")
+    generation.add_argument("--model-path", default="Qwen/Qwen2.5-3B-Instruct")
+    generation.add_argument("--revision", default="aa8e72537993ba99e69dfaafa59ed015b17504d1")
     generation.add_argument("--seed", type=int, default=66)
     generation.add_argument("--max-prompt-length", type=int, default=2048)
     generation.add_argument("--max-new-tokens", type=int, default=256)
     generation.add_argument("--device", default=None)
+    generation.add_argument("--dtype", choices=["float16", "bfloat16", "float32"], default="float16")
+    generation.add_argument("--top-k", type=int, default=64)
     generation.add_argument("--limit", type=int, default=0, help="Positive count for generation smoke tests")
     args = parser.parse_args()
-    if args.stage == "generate" and args.limit < 0:
-        parser.error("--limit must be non-negative")
+    if args.stage == "generate" and (args.limit < 0 or args.top_k < 1):
+        parser.error("--limit must be non-negative and --top-k positive")
     (sample if args.stage == "sample" else generate)(args)
 
 

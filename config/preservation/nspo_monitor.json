@@ -1,0 +1,30 @@
+{
+  "seed": 66,
+  "purpose": "monitor",
+  "sources": [
+    {
+      "domain": "general",
+      "repo_id": "tatsu-lab/alpaca_farm",
+      "revision": "e576524ca841af3c36fd6912e68e5920430928c1",
+      "filename": "alpaca_instructions/unlabeled.json",
+      "split": "unlabeled",
+      "count": 2000
+    },
+    {
+      "domain": "math",
+      "repo_id": "openai/gsm8k",
+      "revision": "740312add88f781978c0658806c59bc2815b9866",
+      "filename": "main/train-00000-of-00001.parquet",
+      "split": "train",
+      "count": 2000
+    },
+    {
+      "domain": "code",
+      "repo_id": "newfacade/LeetCodeDataset",
+      "revision": "215604aeed660029df7de2fea5a4d7b6ed476a08",
+      "filename": "LeetCodeDataset-train.jsonl",
+      "split": "train",
+      "count": 2000
+    }
+  ]
+}
