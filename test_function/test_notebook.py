@@ -3,9 +3,12 @@
 import ast
 import importlib.util
 import json
+import os
 from pathlib import Path
 import sys
 from types import SimpleNamespace
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -50,11 +53,67 @@ def test_colab_small_notebook_keeps_full_grit_workflow():
     assert "DATA_ROOT = REPO / 'data'" in source
     assert "ARTIFACT_ROOT = DRIVE_ROOT / 'artifacts'" in source
     assert "['bash', 'scripts/run_preservation_projectors.sh', 'build']" in source
-    assert "Path(paths['projector_contexts'])" in source
+    assert "['bash', 'scripts/run_preservation_projectors.sh', 'generate']" in source
+    assert "prompt_root / 'projector/preserve_prompts.parquet'" in source
     assert "projector_path.is_file() and projector_path.stat().st_size > 0" in source
     for preparation_command in ("prepare_grit_data.py", "prepare_evaluation_data.py",
                                 "build_projectors.py"):
         assert preparation_command not in source
+
+
+@pytest.mark.parametrize("existing", [False, True])
+def test_colab_preparation_generates_contexts_before_build(tmp_path, existing):
+    from scripts.preservation_data import preservation_paths
+
+    model = SimpleNamespace(policy="test/base", policy_revision="test-revision")
+    notebook = json.loads((ROOT / "GRIT_Colab_Qwen2.5_0.5B_Qwen3Guard_0.6B.ipynb").read_text())
+    source = next("".join(cell["source"]) for cell in notebook["cells"]
+                  if cell["cell_type"] == "code" and "required_data_inputs" in "".join(cell["source"]))
+    data_root, artifact_root = tmp_path / "data", tmp_path / "artifacts"
+    paths = preservation_paths(data_root, artifact_root, model.policy)
+    task, evaluation = data_root / "task.parquet", data_root / "evaluation.parquet"
+    prompts = data_root / "preservation/split_v1/prompts"
+    inputs = [task, evaluation] + [prompts / role / name
+        for role in ("projector", "monitor") for name in ("preserve_prompts.parquet", "manifest.json")]
+
+    def write(path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"fixture")
+
+    for path in inputs:
+        write(path)
+    outputs = [Path(paths[key]) for key in ("projector_contexts", "preserve_file", "projectors_path")]
+    if existing:
+        for path in outputs:
+            write(path)
+    calls = []
+
+    def run(command, *, env, check):
+        assert command[:2] == ["bash", "scripts/run_preservation_projectors.sh"]
+        assert check and env["MODEL_REVISION"] == model.policy_revision
+        assert env["DATA_ROOT"] == str(data_root)
+        stage = command[-1]
+        if stage == "generate":
+            assert not calls
+            assert all(path.exists() == existing for path in outputs)
+            for path in outputs[:2]:
+                write(path)
+        else:
+            assert stage == "build" and calls == ["generate"]
+            assert all(path.is_file() for path in outputs[:2])
+            write(outputs[2])
+        calls.append(stage)
+
+    namespace = dict(Path=Path, DATA_ROOT=data_root, ARTIFACT_ROOT=artifact_root,
+                     TASK_FILE=task, EVALUATION_FILE=evaluation, paths=paths,
+                     SMALL=model, REPO=ROOT, os=os, sys=sys, subprocess=SimpleNamespace(run=run))
+    exec(compile(source, "colab-preparation", "exec"), namespace)
+    assert calls == ["generate", "build"]
+    calls.clear()
+    (prompts / "projector/preserve_prompts.parquet").unlink()
+    with pytest.raises(FileNotFoundError, match="projector prompts"):
+        exec(compile(source, "colab-preparation", "exec"), namespace)
+    assert calls == []
 
 
 def test_colab_small_notebook_has_hf_token_fallback():
