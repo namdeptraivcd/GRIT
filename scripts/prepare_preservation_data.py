@@ -159,11 +159,13 @@ def generate(args) -> None:
         args.model_path, revision=revision, torch_dtype=dtype, attn_implementation="eager",
     ).to(device).eval()
     model.requires_grad_(False)
-    output = args.output_dir
     output.mkdir(parents=True, exist_ok=False)
     generated = []
+    
+    from tqdm import tqdm
+    
     with (output / "contexts.partial.jsonl").open("w", encoding="utf-8") as stream:
-        for index, row in enumerate(rows):
+        for index, row in enumerate(tqdm(rows, desc="Generating contexts")):
             prompt_ids = preservation_prompt_ids(tokenizer, row["prompt"])
             # Do not truncate the problem or the chat template silently.
             if len(prompt_ids) > args.max_prompt_length:
@@ -201,7 +203,6 @@ def generate(args) -> None:
             generated.append(record)
             stream.write(json.dumps(record, ensure_ascii=False) + "\n")
             stream.flush()
-            print(f"Generated {index + 1}/{len(rows)}", flush=True)
     finish_output(output, generated, {
         "stage": "base_contexts", "base_model": args.model_path, "base_revision": revision,
         "tokenizer_sha256": fingerprint, "seed": args.seed, "do_sample": False,
