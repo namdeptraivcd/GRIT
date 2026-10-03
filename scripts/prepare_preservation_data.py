@@ -159,6 +159,7 @@ def generate(args) -> None:
         args.model_path, revision=revision, torch_dtype=dtype, attn_implementation="eager",
     ).to(device).eval()
     model.requires_grad_(False)
+    output = args.output_dir
     output.mkdir(parents=True, exist_ok=False)
     generated = []
     
