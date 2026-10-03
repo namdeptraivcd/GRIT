@@ -56,7 +56,7 @@ def _worker(connection, config, gpu):
                     raise RuntimeError("Refusing rollout from a stale policy version")
                 outputs = engine.generate(
                     [{"prompt_token_ids": ids} for ids in command["prompts"]],
-                    SamplingParams(**command["sampling"], logprobs=0), use_tqdm=False,
+                    SamplingParams(**command["sampling"], logprobs=0), use_tqdm=command.get("progress", True),
                 )
                 groups = []
                 for request in outputs:
@@ -80,8 +80,9 @@ def _worker(connection, config, gpu):
 
 class VLLMRollout:
     def __init__(self, *, model, gpu, revision=None, dtype="auto", max_model_len=1024,
-                 memory_utilization=0.8, seed=66, timeout=1800, trust_remote_code=False):
+                 memory_utilization=0.8, seed=66, timeout=1800, trust_remote_code=False, progress=True):
         self.timeout = timeout
+        self.progress = progress
         self.version = None
         self._temporary = tempfile.TemporaryDirectory(prefix="grit-rollout-")
         context = mp.get_context("spawn")
@@ -128,6 +129,7 @@ class VLLMRollout:
         if self.version != version:
             raise RuntimeError("Synchronize policy weights before generating rollouts")
         self._connection.send({"op": "generate", "version": version, "prompts": prompt_ids,
+                               "progress": getattr(self, "progress", True),
                                "sampling": dict(n=n, max_tokens=max_tokens, temperature=temperature,
                                                 top_p=top_p, seed=seed)})
         reply = self._receive()

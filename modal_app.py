@@ -57,7 +57,7 @@ def bundle_paths(model_path="Qwen/Qwen2.5-3B-Instruct"):
 
 @app.function(gpu="A100-80GB", cpu=4, memory=32768, timeout=86400, volumes=volumes, secrets=secrets)
 def prepare(model_path="Qwen/Qwen2.5-3B-Instruct"):
-    """Prepare 1,000 projector + 6,000 disjoint KL contexts from one frozen base."""
+    """Prepare 1,000 projector + 1,920 disjoint KL contexts from one frozen base."""
     try:
         paths = bundle_paths(model_path)
         if not Path(paths["task_file"]).exists():

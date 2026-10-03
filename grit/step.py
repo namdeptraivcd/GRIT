@@ -7,6 +7,7 @@ import time
 import torch
 
 from grit.curvature import project_vector_with_module_projectors
+from grit.progress import Progress
 from grit.projection import default_module_filter, project_with_projector
 
 
@@ -62,12 +63,13 @@ def q_retention(model, gradients, projectors, module_filter, relaxation):
     return float(numerator / denominator.clamp_min(1e-30)) if numerator is not None else 0.0
 
 
-def accumulate(model, losses: Callable, *, scale=1.0, clear=True):
+def accumulate(model, losses: Callable, *, scale=1.0, clear=True, progress=None, desc="Backward", total=None):
     """Losses are already weighted by the global response count; reduce with SUM."""
     if clear:
         model.zero_grad(set_to_none=True)
     value = 0.0
-    for loss in losses():
+    progress = progress or Progress(False)
+    for loss in progress.track(losses(), desc, total=total, unit="response"):
         if not bool(torch.isfinite(loss)):
             raise FloatingPointError("Nonfinite microbatch loss")
         (loss * scale).backward()
@@ -92,6 +94,7 @@ def grit_step(
     reduce_gradients=lambda gradients: None, module_filter=None,
     check_curvature=False, gradient_topk=5, projector_relaxation=0.0,
     shared_vector_norm=vector_norm,
+    progress=None, task_total=None, preservation_total=None, curvature_total=None,
 ):
     """Apply a projected gradient or AdamW predictor and its own correction.
 
@@ -100,6 +103,7 @@ def grit_step(
     optimizer=None selects the original proposal; otherwise use the functional
     AdamWDirectionPreconditioner. v=0 accepts exactly the cached predictor.
     """
+    progress = progress or Progress(False)
     if lr <= 0 or lambda_pres < 0 or rho <= 0:
         raise ValueError("lr/rho must be positive and lambda_pres nonnegative")
     if not 0.0 <= projector_relaxation <= 1.0:
@@ -118,64 +122,66 @@ def grit_step(
 
     task_rng = rng_state()
     task_tick = time.monotonic()
-    task_loss = accumulate(model, task_losses)
-    g = take_gradients(model, parameters, reduce_gradients)
+    task_loss = accumulate(model, task_losses, progress=progress, desc="Task forward/backward", total=task_total)
+    with progress.phase("Synchronizing task gradients"):
+        g = take_gradients(model, parameters, reduce_gradients)
     task_backward_seconds = time.monotonic() - task_tick
-    task_grad_norm = vector_norm(g)
-    task_gradient_q_retention = q_retention(model, g, projectors, module_filter, projector_relaxation)
-    task_gradient_top = top_norms(g, gradient_topk)
-    predictor_tick = time.monotonic()
-    if optimizer is None:
-        raw = {n: -value for n, value in g.items()}
-        coefficients = {}
-    else:
-        raw, coefficients = optimizer.prepare(parameters, g, derivative=use_curvature and lambda_pres > 0)
-    raw_direction_norm = vector_norm(raw)
-    delta = project(raw)
-    projected_direction_norm = vector_norm(delta)
-    if projector_relaxation < 1.0:
-        hard_squared = max(
-            (projected_direction_norm**2-projector_relaxation**2*raw_direction_norm**2)
-            / (1.0-projector_relaxation**2),
-            0.0,
+    with progress.phase("AdamW predictor / projection / precision checks"):
+        task_grad_norm = vector_norm(g)
+        task_gradient_q_retention = q_retention(model, g, projectors, module_filter, projector_relaxation)
+        task_gradient_top = top_norms(g, gradient_topk)
+        predictor_tick = time.monotonic()
+        if optimizer is None:
+            raw = {n: -value for n, value in g.items()}
+            coefficients = {}
+        else:
+            raw, coefficients = optimizer.prepare(parameters, g, derivative=use_curvature and lambda_pres > 0)
+        raw_direction_norm = vector_norm(raw)
+        delta = project(raw)
+        projected_direction_norm = vector_norm(delta)
+        if projector_relaxation < 1.0:
+            hard_squared = max(
+                (projected_direction_norm**2-projector_relaxation**2*raw_direction_norm**2)
+                / (1.0-projector_relaxation**2),
+                0.0,
+            )
+            hard_projected_direction_norm = math.sqrt(hard_squared)
+            relaxation_added_direction_norm = projector_relaxation * math.sqrt(
+                max(raw_direction_norm**2-hard_squared, 0.0)
+            )
+        else:
+            hard_projected_direction_norm = None
+            relaxation_added_direction_norm = None
+        for value in delta.values():
+            value.mul_(lr)
+        del raw
+        # These full-size buffers are long lived. Keep them off the actor GPU; each
+        # tensor is copied back only when it is used. AdamW state is committed from
+        # the CPU gradient after the candidate weights have passed validation.
+        original = {n: p.detach().to(device="cpu", dtype=torch.float32, copy=True) for n, p in parameters}
+        task_gradients_cpu = (
+            {n: value.detach().to(device="cpu", dtype=torch.float32, copy=True) for n, value in g.items()}
+            if optimizer is not None or check_curvature else None
         )
-        hard_projected_direction_norm = math.sqrt(hard_squared)
-        relaxation_added_direction_norm = projector_relaxation * math.sqrt(
-            max(raw_direction_norm**2-hard_squared, 0.0)
-        )
-    else:
-        hard_projected_direction_norm = None
-        relaxation_added_direction_norm = None
-    for value in delta.values():
-        value.mul_(lr)
-    del raw
-    # These full-size buffers are long lived. Keep them off the actor GPU; each
-    # tensor is copied back only when it is used. AdamW state is committed from
-    # the CPU gradient after the candidate weights have passed validation.
-    original = {n: p.detach().to(device="cpu", dtype=torch.float32, copy=True) for n, p in parameters}
-    task_gradients_cpu = (
-        {n: value.detach().to(device="cpu", dtype=torch.float32, copy=True) for n, value in g.items()}
-        if optimizer is not None or check_curvature else None
-    )
-    del g
+        del g
 
-    def lost_fraction(vector, scale, dtype):
-        changed = lost = 0
-        total = sum(p.numel() for _, p in parameters)
-        with torch.no_grad():
-            for n, p in parameters:
-                before = original[n].to(device=p.device)
-                after = before+vector[n]*scale
-                fp32_changed = after.ne(before)
-                changed += int(fp32_changed.sum())
-                lost += int((fp32_changed & after.to(dtype).eq(before.to(dtype))).sum())
-        return lost/max(changed, 1), changed/max(total, 1)
+        def lost_fraction(vector, scale, dtype):
+            changed = lost = 0
+            total = sum(p.numel() for _, p in parameters)
+            with torch.no_grad():
+                for n, p in parameters:
+                    before = original[n].to(device=p.device)
+                    after = before+vector[n]*scale
+                    fp32_changed = after.ne(before)
+                    changed += int(fp32_changed.sum())
+                    lost += int((fp32_changed & after.to(dtype).eq(before.to(dtype))).sum())
+            return lost/max(changed, 1), changed/max(total, 1)
 
-    predictor_lost_fp16, predictor_changed_fraction = lost_fraction(delta, 1.0, torch.float16)
-    predictor_lost_bf16, _ = lost_fraction(delta, 1.0, torch.bfloat16)
-    if projected_direction_norm > 0 and predictor_changed_fraction == 0:
-        raise FloatingPointError("Predictor rounded back to theta_before in FP32")
-    predictor_seconds = time.monotonic()-predictor_tick
+        predictor_lost_fp16, predictor_changed_fraction = lost_fraction(delta, 1.0, torch.float16)
+        predictor_lost_bf16, _ = lost_fraction(delta, 1.0, torch.bfloat16)
+        if projected_direction_norm > 0 and predictor_changed_fraction == 0:
+            raise FloatingPointError("Predictor rounded back to theta_before in FP32")
+        predictor_seconds = time.monotonic()-predictor_tick
 
     @torch.no_grad()
     def move(vector=None, scale=1.0):
@@ -202,8 +208,10 @@ def grit_step(
         if lambda_pres:
             preservation_tick = time.monotonic()
             move(delta)
-            pres_loss = accumulate(model, preservation_losses)
-            correction = take_gradients(model, parameters, reduce_gradients)
+            pres_loss = accumulate(model, preservation_losses, progress=progress,
+                                   desc="Preservation KL forward/backward", total=preservation_total)
+            with progress.phase("Synchronizing preservation gradients"):
+                correction = take_gradients(model, parameters, reduce_gradients)
             move()
             preservation_backward_seconds = time.monotonic() - preservation_tick
         else:
@@ -211,6 +219,7 @@ def grit_step(
         pres_norm = vector_norm(correction)
         preservation_gradient_top = top_norms(correction, gradient_topk)
         if use_curvature and pres_norm:
+            progress.log("Forming curvature direction Qv / AdamW derivative")
             pv = project(correction)
             projected_preservation_norm = vector_norm(pv)
             if optimizer is None:
@@ -236,19 +245,23 @@ def grit_step(
                 after_preservation_rng = rng_state()
                 central_tick = time.monotonic()
                 try:
-                    def central_difference(probe_radius):
+                    def central_difference(probe_radius, label):
                         move(u, probe_radius)
                         restore_rng(task_rng)
-                        plus_loss = accumulate(model, task_losses)
+                        plus_loss = accumulate(model, task_losses, progress=progress,
+                                               desc=f"{label}: + probe forward/backward", total=curvature_total)
                         move(u, -probe_radius)
                         restore_rng(task_rng)
-                        minus_loss = -accumulate(model, task_losses, scale=-1.0, clear=False)
-                        result = take_gradients(model, parameters, reduce_gradients)
+                        minus_loss = -accumulate(model, task_losses, scale=-1.0, clear=False,
+                                                 progress=progress, desc=f"{label}: - probe forward/backward",
+                                                 total=curvature_total)
+                        with progress.phase(f"{label}: synchronizing probe gradients"):
+                            result = take_gradients(model, parameters, reduce_gradients)
                         for value in result.values():
                             value.div_(2 * probe_radius)
                         return result, plus_loss, minus_loss
 
-                    hvp, fd_plus_loss, fd_minus_loss = central_difference(radius)
+                    hvp, fd_plus_loss, fd_minus_loss = central_difference(radius, "Curvature rho")
                     hvp_norm = vector_norm(hvp)
                     if check_curvature:
                         reference_hvp = {
@@ -256,7 +269,7 @@ def grit_step(
                             for name, value in hvp.items()
                         }
                         del hvp
-                        check_hvp, _, _ = central_difference(2 * radius)
+                        check_hvp, _, _ = central_difference(2 * radius, "Diagnostic 2*rho")
                         check_norm = vector_norm(check_hvp)
                         for name in check_hvp:
                             check_hvp[name].sub_(reference_hvp[name].to(check_hvp[name]))
@@ -264,7 +277,8 @@ def grit_step(
                         del check_hvp
                         move(u, radius)
                         restore_rng(task_rng)
-                        accumulate(model, task_losses)
+                        accumulate(model, task_losses, progress=progress,
+                                   desc="Diagnostic one-sided probe", total=curvature_total)
                         one_sided_hvp = take_gradients(model, parameters, reduce_gradients)
                         for name in one_sided_hvp:
                             one_sided_hvp[name].sub_(task_gradients_cpu[name].to(one_sided_hvp[name])).div_(radius)
@@ -288,6 +302,8 @@ def grit_step(
                     restore_rng(after_preservation_rng)
                     central_difference_seconds = time.monotonic() - central_tick
             del u
+        if not hvp_used:
+            progress.log("Curvature skipped (disabled or zero preservation/direction gradient)")
         coefficients.clear()
         final_tick = time.monotonic()
         correction_norm = vector_norm(correction)
@@ -297,7 +313,7 @@ def grit_step(
         task_delta_norm = vector_norm(delta)
         final_delta_norms = []
         # Validate all candidate weights before mutating either weights or state.
-        for n, p in parameters:
+        for n, p in progress.track(parameters, "Validating final update", unit="tensor"):
             update = delta[n] - lr * lambda_pres * correction[n]
             final_delta_norms.append(torch.linalg.vector_norm(update))
             candidate = original[n].to(device=p.device) + update
@@ -305,11 +321,12 @@ def grit_step(
                 raise FloatingPointError("Nonfinite GRIT candidate; step not committed")
         final_delta_norm = float(torch.linalg.vector_norm(torch.stack(final_delta_norms)))
         with torch.no_grad():
-            for n, p in parameters:
+            for n, p in progress.track(parameters, "Applying final update", unit="tensor"):
                 p.copy_(original[n])
                 p.add_(delta[n]).add_(correction[n], alpha=-lr * lambda_pres)
         if optimizer is not None:
-            optimizer.commit(parameters, task_gradients_cpu)
+            with progress.phase("Committing AdamW state"):
+                optimizer.commit(parameters, task_gradients_cpu)
         final_update_seconds = time.monotonic()-final_tick
     except BaseException:
         move()

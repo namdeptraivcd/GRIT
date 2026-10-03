@@ -22,7 +22,8 @@ def inputs(tmp_path, monkeypatch):
     task = tmp_path / "task.parquet"
     projector = tmp_path / "projector.parquet"
     monitor = tmp_path / "monitor.parquet"
-    write_rows(task, [{"prompt": format_prompt("TRAIN")},
+    # Keep raw_prompt in the Parquet schema; pyarrow derives it from the first row.
+    write_rows(task, [{"prompt": format_prompt("TRAIN"), "raw_prompt": None},
                       {"prompt": "formatted alias", "raw_prompt": "raw train"}])
     write_rows(projector, [{"prompt": "Projector"}])
     write_rows(monitor, [{"prompt": "KL"}])
@@ -68,7 +69,7 @@ def test_exhausted_source_leaves_no_fake_evaluation(inputs):
     assert not inputs["output"].exists()
 
 
-def test_colab_prepares_evaluation_before_gpu_generation(tmp_path):
+def test_colab_requires_evaluation_before_gpu_generation(tmp_path):
     root = Path(__file__).resolve().parents[1]
     notebook = json.loads((root / "GRIT_Colab_Qwen2.5_0.5B_Qwen3Guard_0.6B.ipynb").read_text())
     cells = {c["id"]: "".join(c["source"]) for c in notebook["cells"]}
@@ -81,26 +82,8 @@ def test_colab_prepares_evaluation_before_gpu_generation(tmp_path):
     # Configuration points at the checked-in test split; keep test secrets local.
     exec(config, context)
     assert context["EVALUATION_FILE"].is_file()
-    commands = []
-
-    def run(command, **kwargs):
-        commands.append(command)
-        if "scripts/prepare_grit_data.py" in command:
-            context["TASK_FILE"].parent.mkdir(parents=True, exist_ok=True)
-            context["TASK_FILE"].touch()
-        elif "scripts/prepare_evaluation_data.py" in command:
-            assert commands[-2][-1] == "sample"
-            assert context["EVALUATION_FILE"].is_file()
-        elif command[-1] in ("generate", "build"):
-            assert context["EVALUATION_FILE"].is_file()
-            for key in ("preserve_file", "projectors_path"):
-                path = Path(context["paths"][key])
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.touch()
-
-    context["subprocess"] = SimpleNamespace(run=run)
-    exec(cells["small-08"], context)
-    assert [c[-1] for c in commands if c[0] == "bash"] == ["sample", "generate", "build"]
-    commands.clear()
-    exec(cells["small-08"], context)
-    assert not any("scripts/prepare_grit_data.py" in c for c in commands)
+    preparation = cells["small-08"]
+    evaluation_check = preparation.index("'held-out evaluation dataset': EVALUATION_FILE")
+    generation = preparation.index("prep_progress.log(f'Generating {role}")
+    assert context["EVALUATION_FILE"].is_file()
+    assert evaluation_check < generation

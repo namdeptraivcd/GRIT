@@ -50,13 +50,14 @@ Colab run.
 ```text
 Task prompts -> current-policy vLLM rollout -> frozen rewards/advantages
 Projector prompts (1,000) -> frozen-base responses -> compact projectors
-KL prompts (6,000) -> frozen-base responses + stored base top-64 statistics
+KL prompts (1,920 selected from the 6,000-prompt pool) -> frozen-base responses + stored base top-64 statistics
 PKU-SafeRLHF test prompts (1,000) -> greedy rollout + safety score every 2 steps
 GRIT update -> local checkpoint -> best-effort private Hub upload + metrics
 ```
 
 The projector set contains 334 general, 333 math, and 333 code prompts. The KL
-set contains 2,000 prompts from each domain. Sampling uses the pinned revisions
+response set contains 640 prompts from each domain, selected deterministically
+from the existing 2,000-per-domain prompt pool. Sampling uses the pinned revisions
 in `config/preservation/`, hashes normalized prompts, and rejects overlap between
 the two sets. The checked-in evaluation file contains 1,000 unique prompts sampled
 with seed 66 from the pinned PKU-SafeRLHF test split. Preparation rejects normalized
@@ -70,9 +71,14 @@ general/math/code benchmark.
 The KL sampler shuffles each domain, interleaves domains in a deterministic global
 order, and takes 48 rows per step without replacement until wrap. Its cursor,
 seed, corpus size, and stratification flag are saved in every checkpoint. At 48
-rows per step, one pass through 6,000 rows takes 125 steps; a 40-step run sees
-1,920 distinct rows, or 32% of the corpus. This is monitoring/training coverage
-for the sampled rows, not coverage of the full KL corpus.
+rows per step, a 40-step run consumes all 1,920 generated responses once.
+An incompatible historical 6,000-response directory is renamed with a
+`.partial.<timestamp>.<pid>` suffix before the reduced artifact is generated.
+Source prompt files are unchanged.
+
+Projector contexts skip the teacher-forced top-k statistics pass; projector
+construction uses their stored prompt + response tokens only. Monitor contexts
+retain top-64 plus tail statistics for KL.
 
 Generated context artifacts retain exact token IDs, response boundaries,
 tokenizer fingerprint, prompt provenance, and base revision. Data, model caches,
@@ -124,7 +130,7 @@ eigendecomposition during the offline preparation phase.
 
 ## Fixed base top-64 trust region
 
-For every response-token position, preparation chooses the 64 most probable
+For every monitor response-token position, preparation chooses the 64 most probable
 tokens under the frozen base model. It performs a teacher-forced Hugging Face
 forward with the same chat template and the configured preparation dtype; it
 does not reuse vLLM generation log-probabilities. Each row stores:
@@ -274,6 +280,12 @@ AdamW state, or leave partial actor weights.
 
 `tqdm` shows current/total steps, elapsed time, ETA, reward, main norms, KL
 violation rate, and rollout/reward/task/predictor/preservation/curvature/update times.
+Detailed rank-zero bars report local response/batch counts for safety scoring,
+task backward, KL backward, and each curvature/diagnostic probe. Blocking stages
+(model loading, weight synchronization, predictor, checkpoint save/upload) show
+elapsed time refreshed every five seconds without inventing a completion percentage.
+vLLM reports generation progress. `--no-progress` disables trainer phase bars.
+Notebook subprocesses relay stdout and stderr into each cell.
 Each committed step appends to `metrics.jsonl`; `diagnostics_summary.json` is
 atomically replaced.
 

@@ -24,6 +24,7 @@ from grit.model_profiles import LARGE, SMALL, profile_for_policy
 from grit.optimizer_delta import AdamWDirectionPreconditioner
 from grit.preservation_loss import preservation_kl_loss
 from grit.rollout import VLLMRollout
+from grit.progress import Progress
 from grit.step import grit_step
 from grit.trust_region import coarsened_base_log_probs, coarsened_policy_log_probs, kl_from_log_probs
 
@@ -76,6 +77,8 @@ def parse_args(argv=None):
     parser.add_argument("--validation-steps", type=int, default=2,
                         help="Run greedy safety validation every N committed updates; 0 disables")
     parser.add_argument("--gradient-checkpointing", action="store_true")
+    parser.add_argument("--progress", action=argparse.BooleanOptionalAction, default=True,
+                        help="Detailed phase and microbatch progress (rank zero)")
     parser.add_argument("--max-steps", type=int, default=40)
     parser.add_argument("--save-steps", type=int, default=100)
     parser.add_argument("--seed", type=int, default=66)
@@ -280,10 +283,11 @@ def push_checkpoint(directory, args):
 
 
 @torch.no_grad()
-def base_kl_at_current_policy(model, tokenizer, rows, *, max_length, top_k, device):
+def base_kl_at_current_policy(model, tokenizer, rows, *, max_length, top_k, device, progress=None):
     """Measure the stored-base KL before the first predictor changes the policy."""
     total = count = peak = 0.0
-    for row in rows:
+    progress = progress or Progress(False)
+    for row in progress.track(rows, "Initial base-anchor KL", unit="context"):
         ids, attention, mask, base_ids, base_logp, base_tail = [value.to(device) for value in
             tokenize_preserve_batch(tokenizer, [row], max_length=max_length, top_k=top_k)]
         logits = model(input_ids=ids, attention_mask=attention).logits[:, :-1]
@@ -307,6 +311,7 @@ def run_safety_validation(*, rollout, model, tokenizer, safety, safety_tokenizer
                           evaluation, args, rank, world, device, step):
     """Generate one greedy response per held-out prompt and score all responses."""
     started = time.monotonic()
+    detail = Progress(getattr(args, "progress", True) and rank == 0, prefix=f"Validation step {step} rank 0: ")
     prompts = [str(value).strip() for value in evaluation["prompt"]]
     if not prompts or any(not prompt for prompt in prompts):
         raise ValueError("Safety evaluation requires nonempty prompt values")
@@ -320,7 +325,9 @@ def run_safety_validation(*, rollout, model, tokenizer, safety, safety_tokenizer
             for prompt in prompts
         ]
         if rollout.version != step:
-            rollout.sync(model, step)
+            with detail.phase("Synchronizing vLLM weights"):
+                rollout.sync(model, step)
+        detail.log(f"Generating {len(prompt_ids)} held-out responses")
         return rollout.generate(
             prompt_ids, version=step, n=1, max_tokens=args.max_response_length,
             temperature=0.0, top_p=1.0, seed=args.seed,
@@ -340,10 +347,11 @@ def run_safety_validation(*, rollout, model, tokenizer, safety, safety_tokenizer
     rewards = torch.empty(0, device=device, dtype=torch.float32)
     labels = []
     parse_errors = retries = 0.0
-    safety.to(device)
+    with detail.phase("Moving safety model to GPU"):
+        safety.to(device)
     try:
         reward_parts = []
-        for index in range(0, count, args.reward_batch_size):
+        for index in detail.track(range(0, count, args.reward_batch_size), "Safety scoring", unit="batch"):
             part, part_labels, diagnostics = score_safety_rewards(
                 safety, safety_tokenizer,
                 local_prompts[index:index+args.reward_batch_size],
@@ -413,6 +421,7 @@ def validate_gpu_layout(*, visible: list[str], rollout_gpu: str, world: int, col
 def train(args):
     profile = profile_for_policy(args.model_path)
     rank = int(os.environ.get("RANK", 0))
+    detail = Progress(args.progress and rank == 0, prefix="Setup: ")
     world = int(os.environ.get("WORLD_SIZE", 1))
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")
@@ -426,13 +435,15 @@ def train(args):
     device = torch.device("cuda", local_rank)
     if world > 1:
         dist.init_process_group("nccl")
-    broadcast_call(rank, lambda: validate_hub_access(args))
+    with detail.phase("Checking Hugging Face access"):
+        broadcast_call(rank, lambda: validate_hub_access(args))
     torch.manual_seed(args.seed)
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     from datasets import load_dataset
     from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
+    detail.log("Loading base configuration and tokenizer")
     base_kwargs = dict(revision=args.model_revision, trust_remote_code=args.trust_remote_code)
     base_revision = getattr(AutoConfig.from_pretrained(args.model_path, **base_kwargs), "_commit_hash", None)
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, **base_kwargs)
@@ -445,15 +456,16 @@ def train(args):
             raise ValueError("Checkpoint missing completion marker")
         checkpoint = torch.load(resume / "training.pt", map_location="cpu", weights_only=False)
         allowed_changes = {"resume", "max_steps", "save_steps", "validation_steps",
-                           "output_dir", "rollout_gpu", "rollout_timeout"}
+                           "output_dir", "rollout_gpu", "rollout_timeout", "progress"}
         changed = [key for key, value in vars(args).items()
                    if key not in allowed_changes and checkpoint["args"].get(key) != value]
         if checkpoint["world_size"] != world or changed:
             raise ValueError(f"Resume requires the same training/data settings and world size; changed: {changed}")
-    model = AutoModelForCausalLM.from_pretrained(
-        args.resume or args.model_path, torch_dtype=torch.float32, attn_implementation="sdpa",
-        **({"trust_remote_code": args.trust_remote_code} if args.resume else base_kwargs),
-    ).to(device)
+    with detail.phase("Loading FP32 actor onto GPU"):
+        model = AutoModelForCausalLM.from_pretrained(
+            args.resume or args.model_path, torch_dtype=torch.float32, attn_implementation="sdpa",
+            **({"trust_remote_code": args.trust_remote_code} if args.resume else base_kwargs),
+        ).to(device)
     if sum(parameter.numel() for parameter in model.parameters()) != profile.policy_parameters:
         raise ValueError("Loaded policy parameter count does not match the pinned checkpoint")
     model.config.use_cache = False
@@ -470,15 +482,16 @@ def train(args):
         for key in ("attention_dropout", "hidden_dropout", "hidden_dropout_prob"):
             if hasattr(model.config, key):
                 setattr(model.config, key, 0.0)
-    safety_tokenizer = AutoTokenizer.from_pretrained(args.safety_model_path, padding_side="left",
-                                                    revision=args.safety_model_revision,
-                                                    trust_remote_code=args.trust_remote_code)
-    if safety_tokenizer.pad_token_id is None:
-        safety_tokenizer.pad_token = safety_tokenizer.eos_token
-    safety = AutoModelForCausalLM.from_pretrained(
-        args.safety_model_path, revision=args.safety_model_revision, torch_dtype=torch.bfloat16,
-        trust_remote_code=args.trust_remote_code,
-    ).eval().requires_grad_(False)
+    with detail.phase("Loading safety model and tokenizer"):
+        safety_tokenizer = AutoTokenizer.from_pretrained(args.safety_model_path, padding_side="left",
+                                                        revision=args.safety_model_revision,
+                                                        trust_remote_code=args.trust_remote_code)
+        if safety_tokenizer.pad_token_id is None:
+            safety_tokenizer.pad_token = safety_tokenizer.eos_token
+        safety = AutoModelForCausalLM.from_pretrained(
+            args.safety_model_path, revision=args.safety_model_revision, torch_dtype=torch.bfloat16,
+            trust_remote_code=args.trust_remote_code,
+        ).eval().requires_grad_(False)
     if sum(parameter.numel() for parameter in safety.parameters()) != profile.safety_parameters:
         raise ValueError("Loaded reward-model parameter count does not match the pinned checkpoint")
     optimizer = AdamWDirectionPreconditioner(eps=args.adam_eps, weight_decay=args.weight_decay) if args.task_optimizer == "adamw" else None
@@ -487,50 +500,52 @@ def train(args):
         raise ValueError("--max-steps must exceed the resumed checkpoint step")
     if checkpoint and optimizer:
         optimizer.load_state_dict(checkpoint["task_state"])
-    payload = torch.load(args.projectors_path, map_location="cpu", weights_only=False)
-    if payload.get("base_revision") and payload["base_revision"] != base_revision:
-        raise ValueError("Projector base revision mismatch")
-    projectors = payload.get("projectors", payload)
-    protected = [(name, layer) for name, layer in model.named_modules()
-                 if isinstance(layer, torch.nn.Linear) and args.module_pattern in name]
-    if not protected or any(name not in projectors for name, _ in protected):
-        raise ValueError("Projector artifact does not cover the requested protected Linear modules")
-    from grit.projection import CompactProjector, projector_dimension
-    for name, layer in protected:
-        if projector_dimension(projectors[name]) != layer.in_features:
-            raise ValueError(f"Projector shape mismatch: {name}")
-        if isinstance(projectors[name], CompactProjector):
-            raw = projectors[name]
-            projectors[name] = CompactProjector(raw.basis.to(device=device, dtype=torch.float32),
-                                                 raw.complement, raw.dimension)
-        else:
-            projectors[name] = projectors[name].to(device=device, dtype=torch.float32)
-    task = load_dataset("parquet", data_files=args.task_file, split="train")
-    preserve = load_dataset("parquet", data_files=args.preserve_file, split="train") if args.lambda_pres else None
-    evaluation = load_dataset("parquet", data_files=args.evaluation_file, split="train") if args.evaluation_file else None
-    if evaluation is not None:
-        if "prompt" not in evaluation.column_names or not len(evaluation):
-            raise ValueError("Safety evaluation file needs a nonempty prompt column")
-        if any(not isinstance(prompt, str) or not prompt.strip() for prompt in evaluation["prompt"]):
-            raise ValueError("Safety evaluation prompts must be nonempty strings")
-    if preserve is not None:
-        from scripts.preservation_data import validate_monitoring_split
-        validate_monitoring_split(payload, preserve, evaluation)
-    if preserve is not None and "base_revision" in preserve.column_names:
-        if set(preserve["base_revision"]) != {base_revision}:
-            raise ValueError("Preservation base revision mismatch; use the recorded --model-revision")
-        manifest_path = Path(args.preserve_file).parent / "manifest.json"
-        if not manifest_path.is_file():
-            raise ValueError("Preservation manifest missing")
-        manifest = json.loads(manifest_path.read_text())
-        if manifest.get("base_top_k") != args.top_k:
-            raise ValueError("Preservation top-k manifest mismatch")
-        if manifest.get("base_statistics_dtype") != args.base_statistics_dtype:
-            raise ValueError("Preservation base-statistics dtype does not match --base-statistics-dtype")
-        if "base_statistics_dtype" not in preserve.column_names:
-            raise ValueError("Preservation rows are missing base-statistics dtype")
-        if set(preserve["base_statistics_dtype"]) != {args.base_statistics_dtype}:
-            raise ValueError("Preservation rows and manifest disagree on base-statistics dtype")
+    with detail.phase("Loading and validating projectors"):
+        payload = torch.load(args.projectors_path, map_location="cpu", weights_only=False)
+        if payload.get("base_revision") and payload["base_revision"] != base_revision:
+            raise ValueError("Projector base revision mismatch")
+        projectors = payload.get("projectors", payload)
+        protected = [(name, layer) for name, layer in model.named_modules()
+                     if isinstance(layer, torch.nn.Linear) and args.module_pattern in name]
+        if not protected or any(name not in projectors for name, _ in protected):
+            raise ValueError("Projector artifact does not cover the requested protected Linear modules")
+        from grit.projection import CompactProjector, projector_dimension
+        for name, layer in protected:
+            if projector_dimension(projectors[name]) != layer.in_features:
+                raise ValueError(f"Projector shape mismatch: {name}")
+            if isinstance(projectors[name], CompactProjector):
+                raw = projectors[name]
+                projectors[name] = CompactProjector(raw.basis.to(device=device, dtype=torch.float32),
+                                                     raw.complement, raw.dimension)
+            else:
+                projectors[name] = projectors[name].to(device=device, dtype=torch.float32)
+    with detail.phase("Loading and validating datasets"):
+        task = load_dataset("parquet", data_files=args.task_file, split="train")
+        preserve = load_dataset("parquet", data_files=args.preserve_file, split="train") if args.lambda_pres else None
+        evaluation = load_dataset("parquet", data_files=args.evaluation_file, split="train") if args.evaluation_file else None
+        if evaluation is not None:
+            if "prompt" not in evaluation.column_names or not len(evaluation):
+                raise ValueError("Safety evaluation file needs a nonempty prompt column")
+            if any(not isinstance(prompt, str) or not prompt.strip() for prompt in evaluation["prompt"]):
+                raise ValueError("Safety evaluation prompts must be nonempty strings")
+        if preserve is not None:
+            from scripts.preservation_data import validate_monitoring_split
+            validate_monitoring_split(payload, preserve, evaluation)
+        if preserve is not None and "base_revision" in preserve.column_names:
+            if set(preserve["base_revision"]) != {base_revision}:
+                raise ValueError("Preservation base revision mismatch; use the recorded --model-revision")
+            manifest_path = Path(args.preserve_file).parent / "manifest.json"
+            if not manifest_path.is_file():
+                raise ValueError("Preservation manifest missing")
+            manifest = json.loads(manifest_path.read_text())
+            if manifest.get("base_top_k") != args.top_k:
+                raise ValueError("Preservation top-k manifest mismatch")
+            if manifest.get("base_statistics_dtype") != args.base_statistics_dtype:
+                raise ValueError("Preservation base-statistics dtype does not match --base-statistics-dtype")
+            if "base_statistics_dtype" not in preserve.column_names:
+                raise ValueError("Preservation rows are missing base-statistics dtype")
+            if set(preserve["base_statistics_dtype"]) != {args.base_statistics_dtype}:
+                raise ValueError("Preservation rows and manifest disagree on base-statistics dtype")
     task_sampler = EpochSampler(task, args.seed)
     pres_sampler = EpochSampler(preserve, args.seed+1, stratify=True) if preserve is not None else None
     if checkpoint:
@@ -550,16 +565,20 @@ def train(args):
                                  dtype=args.rollout_dtype, seed=args.seed,
                                  max_model_len=args.max_prompt_length+args.max_response_length,
                                  memory_utilization=args.rollout_memory_utilization,
-                                 timeout=args.rollout_timeout, trust_remote_code=args.trust_remote_code)
-        broadcast_call(rank, start_rollout)
+                                 timeout=args.rollout_timeout, trust_remote_code=args.trust_remote_code,
+                                 progress=args.progress)
+        with detail.phase("Starting persistent vLLM engine"):
+            broadcast_call(rank, start_rollout)
         session_started = time.monotonic()
         metrics_path = output / "metrics.jsonl"
         previous_metrics = []
         if rank == 0 and metrics_path.exists():
             previous_metrics = [json.loads(line) for line in metrics_path.read_text().splitlines() if line.strip()]
         progress = tqdm(range(start+1, args.max_steps+1), total=args.max_steps, initial=start,
-                        desc="GRIT", unit="step", dynamic_ncols=True, disable=rank != 0)
+                        desc="GRIT", unit="step", dynamic_ncols=True, disable=rank != 0 or not args.progress, file=sys.stdout)
         for step in progress:
+            detail.prefix = f"Step {step}/{args.max_steps} rank 0: "
+            detail.log("Sampling task prompts")
             tick = time.monotonic()
             torch.cuda.reset_peak_memory_stats(device)
             rows = task_sampler.rows_for_rank(args.task_batch_size, rank, world)
@@ -573,7 +592,9 @@ def train(args):
                 all_ids[0] = prompt_ids
             def generate():
                 if rollout.version != step-1:
-                    rollout.sync(model, step-1)
+                    with detail.phase("Synchronizing vLLM weights"):
+                        rollout.sync(model, step-1)
+                detail.log(f"Rollout: {args.task_batch_size} prompts x {args.generations} responses")
                 return rollout.generate([ids for group in all_ids for ids in group], version=step-1,
                                         n=args.generations, max_tokens=args.max_response_length,
                                         temperature=1.0, top_p=1.0, seed=args.seed+step)
@@ -586,10 +607,12 @@ def train(args):
             texts = tokenizer.batch_decode([r["token_ids"] for r in responses], skip_special_tokens=True)
             expanded_prompts = [p for p in prompts for _ in range(args.generations)]
             reward_tick = time.monotonic()
-            safety.to(device)
+            with detail.phase("Moving safety model to GPU"):
+                safety.to(device)
             reward_parts = []
             reward_parse_errors = reward_retries = 0.0
-            for index in range(0, len(texts), args.reward_batch_size):
+            for index in detail.track(range(0, len(texts), args.reward_batch_size),
+                                      "Safety rewards", unit="batch"):
                 rewards, _, reward_diag = score_safety_rewards(safety, safety_tokenizer,
                     expanded_prompts[index:index+args.reward_batch_size], texts[index:index+args.reward_batch_size],
                     max_length=args.max_prompt_length+args.max_response_length+512,
@@ -645,7 +668,7 @@ def train(args):
             if step == 1 and pres_sampler is not None:
                 base_kl_mean, base_kl_max = base_kl_at_current_policy(
                     model, tokenizer, pres_rows, max_length=args.max_preserve_length,
-                    top_k=args.top_k, device=device,
+                    top_k=args.top_k, device=device, progress=detail,
                 )
             local_pres_tokens = sum(
                 max(min(len(row["input_ids"]), args.max_preserve_length)-int(row["response_start"]), 0)
@@ -707,7 +730,9 @@ def train(args):
                                 module_filter=lambda n, m: isinstance(m, torch.nn.Linear) and args.module_pattern in n,
                                 check_curvature=check_fd, gradient_topk=args.gradient_topk,
                                 projector_relaxation=args.projector_relaxation,
-                                shared_vector_norm=shared_vector_norm)
+                                shared_vector_norm=shared_vector_norm, progress=detail,
+                                task_total=len(responses), preservation_total=len(pres_rows),
+                                curvature_total=int((advantages != 0).sum()))
             update_seconds = time.monotonic()-update_tick
             # Loss callbacks are global-count weighted; SUM reconstructs global losses.
             scalar = torch.tensor([
@@ -838,11 +863,12 @@ def train(args):
             if step % args.save_steps == 0 or step == args.max_steps:
                 sampler_state = {"task": task_sampler.state_dict(),
                                  "preservation": pres_sampler.state_dict() if pres_sampler else None}
-                checkpoint_dir = broadcast_call(
-                    rank, lambda: save_checkpoint(model, tokenizer, optimizer, args, step, world, sampler_state)
-                )
-                if rank == 0:
-                    hub_push_error = push_checkpoint(checkpoint_dir, args)
+                with detail.phase("Saving checkpoint and uploading to Hub"):
+                    checkpoint_dir = broadcast_call(
+                        rank, lambda: save_checkpoint(model, tokenizer, optimizer, args, step, world, sampler_state)
+                    )
+                    if rank == 0:
+                        hub_push_error = push_checkpoint(checkpoint_dir, args)
             checkpoint_seconds = time.monotonic()-checkpoint_tick
             session_elapsed = time.monotonic()-session_started
             metrics.update(checkpoint_seconds=checkpoint_seconds, step_seconds=time.monotonic()-tick,
@@ -851,6 +877,7 @@ def train(args):
             metrics["hub_push_error"] = hub_push_error
             metrics["alerts"] = step_alerts(metrics, epsilon_pres=args.epsilon_pres)
             if rank == 0:
+                detail.log("Writing metrics and diagnostics")
                 with metrics_path.open("a") as handle:
                     handle.write(json.dumps(metrics)+"\n")
                 previous_metrics.append(metrics)

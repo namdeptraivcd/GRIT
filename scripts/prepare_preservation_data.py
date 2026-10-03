@@ -44,6 +44,35 @@ def read_rows(path: Path) -> list[dict]:
         return json.load(stream)
 
 
+def validate_context_artifact(directory, prompts, *, model_path, revision, limit=0, require_statistics=True):
+    """Validate cached contexts before notebook reuse, including legacy projector caches."""
+    from scripts.preservation_data import select_context_rows
+
+    directory, prompts = Path(directory), Path(prompts)
+    manifest = json.loads((directory / "manifest.json").read_text())
+    parquet = directory / "preserve_contexts.parquet"
+    selected = select_context_rows(read_rows(prompts), limit)
+    expected = {
+        "stage": "base_contexts", "base_model": model_path, "base_revision": revision,
+        "rows": len(selected), "input_sha256": file_hash(prompts),
+        "domain_counts": dict(Counter(row["domain"] for row in selected)),
+        "parquet": parquet.name, "parquet_sha256": file_hash(parquet),
+    }
+    if require_statistics:
+        expected.update(base_top_k=64, base_statistics_dtype="float16")
+    if any(manifest.get(key) != value for key, value in expected.items()):
+        raise ValueError(f"Context manifest mismatch: {directory}")
+    rows = read_rows(parquet)
+    if len(rows) != len(selected) or preservation_prompt_hashes(rows) != preservation_prompt_hashes(selected):
+        raise ValueError(f"Context prompt mismatch: {directory}")
+    if any(row.get("base_revision") != revision or
+           row.get("tokenizer_sha256") != manifest.get("tokenizer_sha256") for row in rows):
+        raise ValueError(f"Context provenance mismatch: {directory}")
+    if require_statistics and any(row.get("base_top_k") != 64 or
+                                  row.get("base_statistics_dtype") != "float16" for row in rows):
+        raise ValueError(f"Context base statistics mismatch: {directory}")
+
+
 def finish_output(output: Path, rows: list[dict], manifest: dict, filename: str) -> None:
     import pyarrow as pa
     import pyarrow.parquet as pq
@@ -107,13 +136,15 @@ def topk_statistics(logits, k: int):
     return ids, top_log_probs, tail
 
 
-def teacher_forced_base_statistics(model, sequence: list[int], response_start: int, k: int, device: str):
+def teacher_forced_base_statistics(model, sequence: list[int], response_start: int, k: int, device: str, progress=None):
     """Compute fixed base statistics without materializing sequence x vocabulary logits."""
     import torch
 
     prefix = torch.tensor([sequence[:response_start]], dtype=torch.long, device=device)
     ids_rows, logp_rows, tail_rows = [], [], []
-    with torch.inference_mode():
+    from grit.progress import Progress
+    progress = progress or Progress(False)
+    with progress.bar("Base top-k statistics", total=len(sequence)-response_start, unit="token") as bar, torch.inference_mode():
         output = model(input_ids=prefix, attention_mask=torch.ones_like(prefix), use_cache=True)
         logits = output.logits[:, -1]
         past = output.past_key_values
@@ -121,6 +152,7 @@ def teacher_forced_base_statistics(model, sequence: list[int], response_start: i
         ids_rows.append(ids[0].cpu())
         logp_rows.append(logp[0].cpu())
         tail_rows.append(tail[0].cpu())
+        bar.update()
         for offset, token in enumerate(sequence[response_start:-1], start=1):
             current = torch.tensor([[token]], dtype=torch.long, device=device)
             attention = torch.ones((1, response_start+offset), dtype=torch.long, device=device)
@@ -130,6 +162,7 @@ def teacher_forced_base_statistics(model, sequence: list[int], response_start: i
             ids_rows.append(ids[0].cpu())
             logp_rows.append(logp[0].cpu())
             tail_rows.append(tail[0].cpu())
+            bar.update()
     return (
         torch.stack(ids_rows).tolist(), torch.stack(logp_rows).tolist(),
         torch.stack(tail_rows).tolist(),
@@ -137,43 +170,49 @@ def teacher_forced_base_statistics(model, sequence: list[int], response_start: i
 
 
 def generate(args) -> None:
+    from grit.progress import Progress
+    from scripts.preservation_data import select_context_rows
+    progress = Progress(getattr(args, "progress", True), prefix=f"{args.output_dir.name}: ")
+    progress.log("[1/4] Loading generation libraries...")
     import torch
     from huggingface_hub import model_info
     from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed
 
     if args.max_prompt_length < 1 or args.max_new_tokens < 1:
         raise ValueError("Token limits must be positive")
+    progress.log(f"[2/4] Reading prompts: {args.prompts}")
     rows = read_rows(args.prompts)
     if not rows:
         raise ValueError("No preservation prompts")
-    if args.limit:
-        rows = rows[:args.limit]
-    revision = model_info(args.model_path, revision=args.revision).sha
-    tokenizer = AutoTokenizer.from_pretrained(args.model_path, revision=revision)
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    fingerprint = tokenizer_fingerprint(tokenizer)
-    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-    dtype = getattr(torch, args.dtype)
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_path, revision=revision, torch_dtype=dtype, attn_implementation="eager",
-    ).to(device).eval()
-    model.requires_grad_(False)
+    rows = select_context_rows(rows, args.limit)
+    skip_statistics = getattr(args, "skip_base_statistics", False)
+    with progress.phase("[3/4] Loading frozen base model/tokenizer"):
+        revision = model_info(args.model_path, revision=args.revision).sha
+        tokenizer = AutoTokenizer.from_pretrained(args.model_path, revision=revision)
+        if tokenizer.pad_token_id is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        fingerprint = tokenizer_fingerprint(tokenizer)
+        device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+        dtype = getattr(torch, args.dtype)
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_path, revision=revision, torch_dtype=dtype, attn_implementation="eager",
+        ).to(device).eval()
+        model.requires_grad_(False)
     output = args.output_dir
     output.mkdir(parents=True, exist_ok=False)
     generated = []
-    
-    from tqdm import tqdm
-    
+
+    progress.log(f"[4/4] {len(rows)} contexts; base statistics: {not skip_statistics}")
+
     with (output / "contexts.partial.jsonl").open("w", encoding="utf-8") as stream:
-        for index, row in enumerate(tqdm(rows, desc="Generating contexts")):
+        for index, row in enumerate(progress.track(rows, "Generating contexts", unit="context")):
             prompt_ids = preservation_prompt_ids(tokenizer, row["prompt"])
             # Do not truncate the problem or the chat template silently.
             if len(prompt_ids) > args.max_prompt_length:
                 raise ValueError(f"{row['id']}: prompt exceeds --max-prompt-length")
             set_seed(args.seed + index)
             inputs = torch.tensor([prompt_ids], dtype=torch.long, device=device)
-            with torch.inference_mode():
+            with progress.phase(f"Response {index+1}/{len(rows)} ({row['domain']}, max {args.max_new_tokens} tokens)"), torch.inference_mode():
                 sequence = model.generate(
                     input_ids=inputs, attention_mask=torch.ones_like(inputs),
                     max_new_tokens=args.max_new_tokens, do_sample=False,
@@ -182,9 +221,6 @@ def generate(args) -> None:
             response_ids = sequence[len(prompt_ids):]
             if not response_ids:
                 raise ValueError(f"{row['id']}: empty generated response")
-            topk_ids, topk_log_probs, log_tail = teacher_forced_base_statistics(
-                model, sequence, len(prompt_ids), args.top_k, device,
-            )
             record = {
                 **row,
                 "text": tokenizer.decode(sequence, skip_special_tokens=False),
@@ -195,21 +231,27 @@ def generate(args) -> None:
                 "tokenizer_sha256": fingerprint,
                 "base_model": args.model_path,
                 "base_revision": revision,
-                "base_topk_ids": topk_ids,
-                "base_topk_log_probs": topk_log_probs,
-                "base_log_tail": log_tail,
-                "base_top_k": args.top_k,
-                "base_statistics_dtype": str(dtype).removeprefix("torch."),
             }
+            if not skip_statistics:
+                topk_ids, topk_log_probs, log_tail = teacher_forced_base_statistics(
+                    model, sequence, len(prompt_ids), args.top_k, device, progress=progress,
+                )
+                record.update(base_topk_ids=topk_ids, base_topk_log_probs=topk_log_probs,
+                              base_log_tail=log_tail, base_top_k=args.top_k,
+                              base_statistics_dtype=str(dtype).removeprefix("torch."))
             generated.append(record)
             stream.write(json.dumps(record, ensure_ascii=False) + "\n")
             stream.flush()
+    statistics = {} if skip_statistics else {
+        "base_top_k": args.top_k, "base_statistics_dtype": str(dtype).removeprefix("torch."),
+        "base_statistics": "teacher-forced HF forward; fixed base top-k plus tail",
+    }
+    progress.log("Saving context artifacts...")
     finish_output(output, generated, {
         "stage": "base_contexts", "base_model": args.model_path, "base_revision": revision,
         "tokenizer_sha256": fingerprint, "seed": args.seed, "do_sample": False,
         "max_prompt_length": args.max_prompt_length, "max_new_tokens": args.max_new_tokens,
-        "base_top_k": args.top_k, "base_statistics_dtype": str(dtype).removeprefix("torch."),
-        "base_statistics": "teacher-forced HF forward; fixed base top-k plus tail",
+        **statistics, "context_limit": args.limit,
         "input_sha256": file_hash(args.prompts),
     }, "preserve_contexts.parquet")
     (output / "contexts.partial.jsonl").rename(output / "contexts.jsonl")
@@ -235,7 +277,10 @@ def main() -> None:
     generation.add_argument("--device", default=None)
     generation.add_argument("--dtype", choices=["float16", "bfloat16", "float32"], default="float16")
     generation.add_argument("--top-k", type=int, default=64)
-    generation.add_argument("--limit", type=int, default=0, help="Positive count for generation smoke tests")
+    generation.add_argument("--limit", type=int, default=0, help="Balanced context count; 0 uses all prompts")
+    generation.add_argument("--skip-base-statistics", action="store_true",
+                            help="Projector contexts need only tokens; skip teacher-forced top-k forwards")
+    generation.add_argument("--progress", action=argparse.BooleanOptionalAction, default=True)
     args = parser.parse_args()
     if args.stage == "generate" and (args.limit < 0 or args.top_k < 1):
         parser.error("--limit must be non-negative and --top-k positive")

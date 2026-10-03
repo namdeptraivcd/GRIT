@@ -21,6 +21,25 @@ def preservation_paths(data_root, artifact_root, model_path: str) -> dict[str, s
     }
 
 
+def select_context_rows(rows, limit=0):
+    """Deterministic balanced subset of existing prompts; never resample sources."""
+    if not limit:
+        return rows
+    if limit < 0 or limit > len(rows):
+        raise ValueError(f"Need {limit} contexts but only {len(rows)} prompts are available")
+    domains = sorted({row["domain"] for row in rows})
+    count, remainder = divmod(limit, len(domains))
+    quotas = {domain: count + (index < remainder) for index, domain in enumerate(domains)}
+    selected = []
+    for row in rows:
+        if quotas[row["domain"]]:
+            selected.append(row)
+            quotas[row["domain"]] -= 1
+    if any(quotas.values()):
+        raise ValueError(f"Not enough prompts for balanced context subset: {quotas}")
+    return selected
+
+
 def prompt_key(text: str) -> str:
     normalized = " ".join(unicodedata.normalize("NFKC", text).split()).casefold()
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()

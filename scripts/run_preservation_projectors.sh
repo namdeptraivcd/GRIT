@@ -43,12 +43,15 @@ check_dataset() {
 import json, sys
 from pathlib import Path
 from scripts.prepare_preservation_data import file_hash, read_rows
-from scripts.preservation_data import preservation_prompt_hashes
+from scripts.preservation_data import preservation_prompt_hashes, select_context_rows
 root, filename, stage, config_path, input_path, exclude_path, model_path = sys.argv[1:]
 root = Path(root)
 config = json.loads(Path(config_path).read_text())
 manifest = json.loads((root / 'manifest.json').read_text())
 expected_counts = {source['domain']: source['count'] for source in config['sources']}
+context_limit = 1920 if stage == 'base_contexts' and config['purpose'] == 'monitor' else 0
+if context_limit:
+    expected_counts = {'general': 640, 'math': 640, 'code': 640}
 assert manifest['stage'] == stage, 'Unexpected preservation stage'
 assert manifest['rows'] == sum(expected_counts.values()), 'Unexpected preservation row count'
 assert manifest['domain_counts'] == expected_counts, 'Unexpected domain counts'
@@ -66,13 +69,15 @@ if stage == 'prompts_only':
 else:
     assert manifest['base_model'] == model_path, 'Base model mismatch'
     assert manifest['input_sha256'] == file_hash(Path(input_path)), 'Source prompts changed'
-    assert hashes == preservation_prompt_hashes(read_rows(Path(input_path))), 'Context prompts mismatch'
+    selected = select_context_rows(read_rows(Path(input_path)), context_limit)
+    assert hashes == preservation_prompt_hashes(selected), 'Context prompts mismatch'
     assert {row['base_revision'] for row in rows} == {manifest['base_revision']}
     assert {row['tokenizer_sha256'] for row in rows} == {manifest['tokenizer_sha256']}
-    assert manifest['base_top_k'] == 64, 'Stored base top-k mismatch'
-    assert manifest['base_statistics_dtype'] == 'float16', 'Stored base-statistics dtype mismatch'
-    assert all(row['base_top_k'] == 64 for row in rows)
-    assert {row['base_statistics_dtype'] for row in rows} == {'float16'}
+    if config['purpose'] == 'monitor':
+        assert manifest['base_top_k'] == 64, 'Stored base top-k mismatch'
+        assert manifest['base_statistics_dtype'] == 'float16', 'Stored base-statistics dtype mismatch'
+        assert all(row['base_top_k'] == 64 for row in rows)
+        assert {row['base_statistics_dtype'] for row in rows} == {'float16'}
 if exclude_path:
     assert hashes.isdisjoint(preservation_prompt_hashes(read_rows(Path(exclude_path)))), 'Projector/KL prompt overlap'
 print('Verified:', root / filename)
@@ -117,11 +122,13 @@ from pathlib import Path
 print(json.loads((Path(sys.argv[1]).parent / 'manifest.json').read_text())['base_revision'])
 PY
 )
-      generation_args+=(--revision "$base_revision")
+      generation_args+=(--revision "$base_revision" --limit 1920)
     else
-      generation_args+=(--revision "$MODEL_REVISION")
+      generation_args+=(--revision "$MODEL_REVISION" --skip-base-statistics)
     fi
-    if [[ ! -s "$contexts/manifest.json" ]]; then
+    if [[ -s "$contexts/manifest.json" ]] && check_dataset "$contexts" preserve_contexts.parquet base_contexts "$config" "$prompts/preserve_prompts.parquet" "$exclude"; then
+      echo "Reusing complete contexts: $contexts"
+    else
       keep_partial "$contexts"
       "$PYTHON_BIN" -u scripts/prepare_preservation_data.py generate \
         --prompts "$prompts/preserve_prompts.parquet" --output-dir "$contexts" \
@@ -148,7 +155,7 @@ PY
 fi
 if [[ "$STAGE" == build || "$STAGE" == all ]]; then
   if [[ -e "$PROJECTORS_PATH" ]]; then
-    "$PYTHON_BIN" - "$PROJECTORS_PATH" "$PROJECTOR_CONTEXTS" "$MONITOR_CONTEXTS" <<'PY'
+    if "$PYTHON_BIN" - "$PROJECTORS_PATH" "$PROJECTOR_CONTEXTS" "$MONITOR_CONTEXTS" <<'PY'
 import json, sys, torch
 from pathlib import Path
 from scripts.prepare_preservation_data import file_hash, read_rows
@@ -161,7 +168,11 @@ assert set(payload['projector_prompt_sha256']) == preservation_prompt_hashes(rea
 validate_monitoring_split(payload, read_rows(monitor))
 print('Verified existing projector:', artifact)
 PY
-    exit 0
+    then
+      exit 0
+    else
+      keep_partial "$PROJECTORS_PATH"
+    fi
   fi
   BASE_REVISION=$("$PYTHON_BIN" - "$(dirname "$PROJECTOR_CONTEXTS")/manifest.json" <<'PY'
 import json, sys

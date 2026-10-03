@@ -22,8 +22,9 @@ launch. It requires a Modal secret containing `HF_TOKEN`, a Hub repository ID,
 and a separately prepared evaluation-prompt parquet used for disjointness checks.
 Do not start the paid GPU job until the artifacts and evaluation input are ready.
 
-Preparation creates 1,000 projector contexts and 6,000 disjoint KL contexts.
-Frozen-base top-64 IDs, log-probabilities, and tail mass are stored with each
+Preparation creates 1,000 projector contexts without top-k statistics and 1,920
+disjoint KL contexts (48 × 40 steps), selected evenly from the existing prompt pool.
+Frozen-base top-64 IDs, log-probabilities, and tail mass are stored with each KL
 context, so the trainer does not load a second policy-sized base model. Projectors
 are stored as a basis for the smaller subspace rather than dense matrices.
 
