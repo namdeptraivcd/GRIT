@@ -43,10 +43,27 @@ def test_colab_small_notebook_keeps_full_grit_workflow():
             ast.parse("".join(cell["source"]), filename=f"colab-small:{index}")
             assert cell["outputs"] == [] and cell["execution_count"] is None
     for required in ("SMALL.policy", "SMALL.safety", "allow_colocated_rollout", "rollout_memory_utilization",
-                     "run_preservation_projectors.sh", "task_batch_size': 321", "preserve_batch_size': 48",
+                     "required_data_inputs", "task_batch_size': 321", "preserve_batch_size': 48",
                      "top_k': 64", "use_curvature': True", "validation_steps': 2",
                      "pku_saferlhf_test_1000.parquet", "--resume", "complete.json"):
         assert required in source
+    assert "DATA_ROOT = REPO / 'data'" in source
+    assert "ARTIFACT_ROOT = DRIVE_ROOT / 'artifacts'" in source
+    assert "['bash', 'scripts/run_preservation_projectors.sh', 'build']" in source
+    assert "Path(paths['projector_contexts'])" in source
+    assert "projector_path.is_file() and projector_path.stat().st_size > 0" in source
+    for preparation_command in ("prepare_grit_data.py", "prepare_evaluation_data.py",
+                                "build_projectors.py"):
+        assert preparation_command not in source
+
+
+def test_colab_small_notebook_has_hf_token_fallback():
+    notebook = json.loads((ROOT / "GRIT_Colab_Qwen2.5_0.5B_Qwen3Guard_0.6B.ipynb").read_text())
+    source = "".join("".join(cell["source"]) for cell in notebook["cells"])
+    assert "os.environ.get('HF_TOKEN'" in source
+    assert "userdata.get('HF_TOKEN')" in source
+    assert "except Exception as exc:" in source
+    assert "getpass('HF_TOKEN (input hidden): ')" in source
 
 
 def test_modal_source_paths_and_resource_config(monkeypatch):

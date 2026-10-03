@@ -1,0 +1,48 @@
+{
+  "dataset": "PKU-Alignment/PKU-SafeRLHF",
+  "revision": "9421ffafec3fa40a1f1a7d567b4d525079477ecb",
+  "split": "train",
+  "rows": 11000,
+  "unique_normalized_prompts": 11000,
+  "seed": 66,
+  "prefer_safe": true,
+  "sampling": "shuffle all default-config train rows; skip empty, duplicate, and evaluation/preservation prompts",
+  "sources": [
+    {
+      "filename": "data/Alpaca-7B/train.jsonl",
+      "sha256": "e9aeebe2bbbed37d7a28561809f47c6c0622e48b170c80bc2eb72d908d2c4666",
+      "rows": 27393
+    },
+    {
+      "filename": "data/Alpaca2-7B/train.jsonl",
+      "sha256": "f7845941c570087a320121d222cbdc500189c59310c60aadaf23b14877c92e0a",
+      "rows": 25564
+    },
+    {
+      "filename": "data/Alpaca3-8B/train.jsonl",
+      "sha256": "21c3b4f2572444e42d161f09166471d14208c9e153fcc0ec900ae05013e47d4c",
+      "rows": 20950
+    }
+  ],
+  "skipped_before_target": {
+    "empty": 0,
+    "overlap": 476,
+    "duplicate": 1242
+  },
+  "exclusions": [
+    {
+      "path": "data/evaluation/pku_saferlhf_test_1000.parquet",
+      "sha256": "4a291b725195f4a262e60bb11784e229def03a14d99cc71f57517c0a7fed1c02"
+    },
+    {
+      "path": "data/preservation/split_v1/prompts/projector/prompts.jsonl",
+      "sha256": "ff93a6571704e2eacd8ecee2cff3c74423de61bc443a4e8a2c69316483977f32"
+    },
+    {
+      "path": "data/preservation/split_v1/prompts/monitor/prompts.jsonl",
+      "sha256": "3b12ee33efec2259d42fde7a18691b4dff7ac538be2ef30863450104fc220358"
+    }
+  ],
+  "parquet": "task_train.parquet",
+  "parquet_sha256": "1ea9971e2d767144ff2ba237cc4451a9f6572719b540a42746a4db782b251208"
+}
