@@ -41,6 +41,8 @@ the persistent vLLM process to share GPU 0. This exception is restricted to the
 small pinned profile; policy-version synchronization and frozen rollouts are
 unchanged. The task and preservation datasets, top-64 KL, projector construction,
 AdamW predictor, and central-difference correction follow the same workflow.
+Its training configuration uses task response microbatches of 24, reward-model
+batches of 32, preservation microbatches of 2, and `epsilon_pres=0.05`.
 The notebook saves complete checkpoints on Drive and resumes manually after a
 Colab interruption. Colocated GPU memory fit and run duration require an actual
 Colab run.
@@ -189,13 +191,15 @@ finite and installed successfully.
 
 One logical step is:
 
-1. Accumulate task losses one response at a time. Each loss is divided by the
-   global 1,605-response denominator. Move `p.grad` ownership into an FP32 tensor,
-   clear `p.grad`, and SUM-reduce once.
+1. Accumulate task losses in configurable response microbatches. Each response
+   retains its own token mean, and each microbatch is weighted by its actual
+   response count over the global 1,605-response denominator. Move `p.grad`
+   ownership into an FP32 tensor, clear `p.grad`, and SUM-reduce once.
 2. Form the functional AdamW direction and `Delta_task`. Save `theta_before` by
    FP32 CPU copy. Never restore by subtracting a rounded delta.
 3. Set `theta_pred=theta_before+Delta_task`. Accumulate 48 response-only KL
-   losses, divided by the global valid response-token count, and SUM-reduce `v`.
+   contexts in configurable microbatches, divide their summed loss by the global
+   valid response-token count, and SUM-reduce `v`.
 4. Restore `theta_before`. If `v=0` globally, accept the cached task delta and
    skip curvature. This is expected while all tokens are within the KL ball.
 5. Form `Qv`; update `c = v - lr*wd*Qv`; then reuse the `Qv` buffer in place as

@@ -19,7 +19,7 @@ from tqdm.auto import tqdm
 
 from grit.data import score_safety_rewards, tokenize_preserve_batch
 from grit.diagnostics import step_alerts, summarize_metrics
-from grit.grpo import group_advantages, grpo_loss, response_batch, token_log_probs
+from grit.grpo import group_advantages, grpo_loss, response_microbatch, token_log_probs
 from grit.model_profiles import LARGE, SMALL, profile_for_policy
 from grit.optimizer_delta import AdamWDirectionPreconditioner
 from grit.preservation_loss import preservation_kl_loss
@@ -47,7 +47,11 @@ def parse_args(argv=None):
     parser.add_argument("--rollout-memory-utilization", type=float, default=0.8)
     parser.add_argument("--rollout-timeout", type=float, default=1800)
     parser.add_argument("--task-batch-size", type=int, default=321, help="Global prompts per optimizer step")
+    parser.add_argument("--task-microbatch-size", type=int, default=1,
+                        help="Frozen rollout responses per actor forward/backward")
     parser.add_argument("--preserve-batch-size", type=int, default=48, help="Global monitoring contexts per step")
+    parser.add_argument("--preservation-microbatch-size", type=int, default=1,
+                        help="Monitoring contexts per actor forward/backward")
     parser.add_argument("--generations", type=int, default=5)
     parser.add_argument("--max-prompt-length", type=int, default=512)
     parser.add_argument("--max-response-length", type=int, default=256)
@@ -86,7 +90,8 @@ def parse_args(argv=None):
     parser.add_argument("--hub-repo-id", default=os.environ.get("GRIT_HUB_REPO_ID"))
     parser.add_argument("--hub-token-env", default="HF_TOKEN")
     args = parser.parse_args(argv)
-    for key in ("task_batch_size", "preserve_batch_size", "generations", "max_prompt_length",
+    for key in ("task_batch_size", "task_microbatch_size", "preserve_batch_size",
+                "preservation_microbatch_size", "generations", "max_prompt_length",
                 "max_response_length", "max_preserve_length", "reward_batch_size", "max_steps", "save_steps",
                 "safety_max_new_tokens", "safety_attempts"):
         if getattr(args, key) < 1:
@@ -633,22 +638,29 @@ def train(args):
                 "response_tokens": 0, "response_tokens_min": float("inf"), "response_tokens_max": 0,
             }
             task_pass = 0
-            # Store tokens/logprobs on CPU; only one response's activations are live.
+            # Store frozen tokens/logprobs on CPU; only one response microbatch's activations are live.
             def task_losses():
                 nonlocal task_pass
                 task_pass += 1
-                for index, response in enumerate(responses):
-                    if task_pass > 1 and advantages[index] == 0:
-                        continue
-                    batch = response_batch(prompt_ids[index//args.generations], response["token_ids"], device)
+                active_indices = (
+                    list(range(len(responses))) if task_pass == 1
+                    else torch.nonzero(advantages != 0, as_tuple=False).flatten().tolist()
+                )
+                for offset in range(0, len(active_indices), args.task_microbatch_size):
+                    indices = active_indices[offset:offset+args.task_microbatch_size]
+                    batch, old = response_microbatch(
+                        [prompt_ids[index//args.generations] for index in indices],
+                        [responses[index]["token_ids"] for index in indices],
+                        [responses[index]["log_probs"] for index in indices],
+                        pad_token_id=tokenizer.pad_token_id, device=device,
+                    )
                     values, mask = token_log_probs(model, batch)
-                    old = torch.tensor([response["log_probs"]], device=device, dtype=values.dtype)
-                    # log-probs only cover sampled response tokens, not prompt positions.
-                    response_values = values[mask].reshape(1, -1)
+                    old = old.to(values.dtype)
                     if task_pass == 1:
-                        error = (response_values.detach()-old).abs()
-                        ratio = torch.exp(response_values.detach()-old)
-                        count = old.numel()
+                        error = (values.detach()-old).abs()[mask]
+                        ratio = torch.exp(values.detach()-old)[mask]
+                        lengths = mask.sum(-1)
+                        count = int(lengths.sum())
                         task_diag["logprob_abs_sum"] += float(error.sum())
                         task_diag["logprob_abs_max"] = max(task_diag["logprob_abs_max"], float(error.max()))
                         task_diag["logprob_count"] += count
@@ -659,10 +671,12 @@ def train(args):
                         task_diag["ratio_max"] = max(task_diag["ratio_max"], float(ratio.max()))
                         task_diag["clip_count"] += int((ratio.sub(1).abs() > args.clip_ratio).sum())
                         task_diag["response_tokens"] += count
-                        task_diag["response_tokens_min"] = min(task_diag["response_tokens_min"], count)
-                        task_diag["response_tokens_max"] = max(task_diag["response_tokens_max"], count)
-                    yield grpo_loss(response_values, old, advantages[index:index+1],
-                                    torch.ones_like(response_values, dtype=torch.bool), args.clip_ratio) / global_responses
+                        task_diag["response_tokens_min"] = min(task_diag["response_tokens_min"], int(lengths.min()))
+                        task_diag["response_tokens_max"] = max(task_diag["response_tokens_max"], int(lengths.max()))
+                    # grpo_loss averages this microbatch, so restore the global
+                    # response mean with its actual (possibly short) batch size.
+                    yield grpo_loss(values, old, advantages[indices], mask, args.clip_ratio) \
+                        * len(indices) / global_responses
             pres_rows = pres_sampler.rows_for_rank(args.preserve_batch_size, rank, world) if pres_sampler is not None else []
             base_kl_mean = base_kl_max = None
             if step == 1 and pres_sampler is not None:
@@ -683,9 +697,10 @@ def train(args):
                          "violations": 0, "eta_sum": 0.0, "eta_max": 0.0,
                          "values": [], "eta_values": [], "coverage": [], "domains": {}}
             def preservation_losses():
-                for row in pres_rows:
+                for offset in range(0, len(pres_rows), args.preservation_microbatch_size):
+                    rows_batch = pres_rows[offset:offset+args.preservation_microbatch_size]
                     ids, attention, mask, base_ids, base_logp, base_tail = [v.to(device) for v in tokenize_preserve_batch(
-                        tokenizer, [row], max_length=args.max_preserve_length, top_k=args.top_k)]
+                        tokenizer, rows_batch, max_length=args.max_preserve_length, top_k=args.top_k)]
                     logits = model(input_ids=ids, attention_mask=attention).logits[:, :-1]
                     result = preservation_kl_loss(
                         logits, epsilon_pres=args.epsilon_pres, response_mask=mask,
@@ -693,32 +708,34 @@ def train(args):
                         base_log_tail=base_tail, reduction="sum",
                     )
                     active = mask.bool()
-                    token_kl = result.projection.token_kl[active].detach()
-                    projected_kl = result.projection.projected_kl[active].detach()
-                    eta = result.projection.eta[active].detach()
-                    violations = result.projection.violation_mask[active]
-                    if token_kl.numel():
-                        pres_diag["count"] += token_kl.numel()
-                        pres_diag["kl_sum"] += float(token_kl.sum())
-                        pres_diag["kl_max"] = max(pres_diag["kl_max"], float(token_kl.max()))
-                        pres_diag["projected_kl_max"] = max(pres_diag["projected_kl_max"], float(projected_kl.max()))
-                        pres_diag["violations"] += int(violations.sum())
-                        pres_diag["eta_sum"] += float(eta.sum())
-                        pres_diag["eta_max"] = max(pres_diag["eta_max"], float(eta.max()))
-                        values = token_kl.float().cpu().tolist()
-                        eta_values = eta.float().cpu().tolist()
-                        coverage = (1-base_tail[active].exp()).float().cpu().tolist()
-                        pres_diag["values"].extend(values)
-                        pres_diag["eta_values"].extend(eta_values)
-                        pres_diag["coverage"].extend(coverage)
-                        domain = pres_diag["domains"].setdefault(
-                            row["domain"], {"kl": [], "violations": 0, "tokens": 0,
-                                            "contexts": 0, "violating_contexts": 0})
-                        domain["kl"].extend(values)
-                        domain["violations"] += int(violations.sum())
-                        domain["tokens"] += len(values)
-                        domain["contexts"] += 1
-                        domain["violating_contexts"] += int(bool(violations.any()))
+                    for row_index, row in enumerate(rows_batch):
+                        row_active = active[row_index]
+                        token_kl = result.projection.token_kl[row_index][row_active].detach()
+                        projected_kl = result.projection.projected_kl[row_index][row_active].detach()
+                        eta = result.projection.eta[row_index][row_active].detach()
+                        violations = result.projection.violation_mask[row_index][row_active]
+                        if token_kl.numel():
+                            pres_diag["count"] += token_kl.numel()
+                            pres_diag["kl_sum"] += float(token_kl.sum())
+                            pres_diag["kl_max"] = max(pres_diag["kl_max"], float(token_kl.max()))
+                            pres_diag["projected_kl_max"] = max(pres_diag["projected_kl_max"], float(projected_kl.max()))
+                            pres_diag["violations"] += int(violations.sum())
+                            pres_diag["eta_sum"] += float(eta.sum())
+                            pres_diag["eta_max"] = max(pres_diag["eta_max"], float(eta.max()))
+                            values = token_kl.float().cpu().tolist()
+                            eta_values = eta.float().cpu().tolist()
+                            coverage = (1-base_tail[row_index][row_active].exp()).float().cpu().tolist()
+                            pres_diag["values"].extend(values)
+                            pres_diag["eta_values"].extend(eta_values)
+                            pres_diag["coverage"].extend(coverage)
+                            domain = pres_diag["domains"].setdefault(
+                                row["domain"], {"kl": [], "violations": 0, "tokens": 0,
+                                                "contexts": 0, "violating_contexts": 0})
+                            domain["kl"].extend(values)
+                            domain["violations"] += int(violations.sum())
+                            domain["tokens"] += len(values)
+                            domain["contexts"] += 1
+                            domain["violating_contexts"] += int(bool(violations.any()))
                     yield result.loss / global_pres_tokens
             update_tick = time.monotonic()
             check_fd = bool(args.fd_check_interval and args.use_curvature and
@@ -731,8 +748,9 @@ def train(args):
                                 check_curvature=check_fd, gradient_topk=args.gradient_topk,
                                 projector_relaxation=args.projector_relaxation,
                                 shared_vector_norm=shared_vector_norm, progress=detail,
-                                task_total=len(responses), preservation_total=len(pres_rows),
-                                curvature_total=int((advantages != 0).sum()))
+                                task_total=(len(responses)+args.task_microbatch_size-1)//args.task_microbatch_size,
+                                preservation_total=(len(pres_rows)+args.preservation_microbatch_size-1)//args.preservation_microbatch_size,
+                                curvature_total=(int((advantages != 0).sum())+args.task_microbatch_size-1)//args.task_microbatch_size)
             update_seconds = time.monotonic()-update_tick
             # Loss callbacks are global-count weighted; SUM reconstructs global losses.
             scalar = torch.tensor([

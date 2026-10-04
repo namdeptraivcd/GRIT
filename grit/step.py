@@ -69,7 +69,7 @@ def accumulate(model, losses: Callable, *, scale=1.0, clear=True, progress=None,
         model.zero_grad(set_to_none=True)
     value = 0.0
     progress = progress or Progress(False)
-    for loss in progress.track(losses(), desc, total=total, unit="response"):
+    for loss in progress.track(losses(), desc, total=total, unit="microbatch"):
         if not bool(torch.isfinite(loss)):
             raise FloatingPointError("Nonfinite microbatch loss")
         (loss * scale).backward()

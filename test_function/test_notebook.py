@@ -47,8 +47,11 @@ def test_colab_small_notebook_keeps_full_grit_workflow():
             ast.parse("".join(cell["source"]), filename=f"colab-small:{index}")
             assert cell["outputs"] == [] and cell["execution_count"] is None
     for required in ("SMALL.policy", "SMALL.safety", "allow_colocated_rollout", "rollout_memory_utilization",
-                     "required_data_inputs", "task_batch_size': 250", "preserve_batch_size': 48",
-                     "top_k': 64", "use_curvature': True", "validation_steps': 5",
+                     "required_data_inputs", "task_batch_size': 250", "task_microbatch_size': 24",
+                     "preserve_batch_size': 48", "preservation_microbatch_size': 2",
+                     "reward_batch_size': 32",
+                     "top_k': 64", "epsilon_pres': 0.05", "use_curvature': True", "validation_steps': 5",
+                     "fd_check_interval': 0",
                      "pku_saferlhf_test_1000.parquet", "--resume", "complete.json"):
         assert required in source
     assert "DATA_ROOT = REPO / 'data'" in source
@@ -62,6 +65,31 @@ def test_colab_small_notebook_keeps_full_grit_workflow():
     for preparation_command in ("prepare_grit_data.py", "prepare_evaluation_data.py",
                                 "build_projectors.py"):
         assert preparation_command not in source
+
+
+def test_colab_training_cell_matches_backend_cli(tmp_path):
+    """Exercise the actual notebook arguments without starting pytest or training."""
+    from grit.model_profiles import SMALL
+    from scripts.train_grit import parse_args
+
+    notebook = json.loads((ROOT / "GRIT_Colab_Qwen2.5_0.5B_Qwen3Guard_0.6B.ipynb").read_text())
+    source = next("".join(cell["source"]) for cell in notebook["cells"]
+                  if cell["cell_type"] == "code" and "[Cell 5/7] Starting" in "".join(cell["source"]))
+    commands = []
+    namespace = {
+        "sys": sys, "run_with_progress": commands.append, "SMALL": SMALL,
+        "TASK_FILE": tmp_path / "task.parquet",
+        "EVALUATION_FILE": tmp_path / "evaluation.parquet",
+        "OUTPUT_DIR": tmp_path / "run", "HUB_REPO_ID": "test/grit",
+        "paths": {"preserve_file": str(tmp_path / "preserve.parquet"),
+                  "projectors_path": str(tmp_path / "projectors.pt")},
+    }
+    exec(compile(source, "colab:cell5", "exec"), namespace)
+    assert len(commands) == 1 and commands[0][1:3] == ["-m", "pytest"]
+    args = parse_args(namespace["arguments"])
+    assert args.task_microbatch_size == 24
+    assert args.preservation_microbatch_size == 2
+    assert args.model_path == SMALL.policy and args.allow_colocated_rollout
 
 
 def test_colab_preparation_validates_inputs_generates_reduced_contexts_then_builds():

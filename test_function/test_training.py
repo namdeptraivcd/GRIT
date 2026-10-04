@@ -7,7 +7,7 @@ import torch
 from torch import nn
 
 from grit.data import parse_safety_reward, score_safety_rewards
-from grit.grpo import grpo_loss, group_advantages, response_batch
+from grit.grpo import grpo_loss, group_advantages, response_batch, response_microbatch, token_log_probs
 from grit.optimizer_delta import AdamWDirectionPreconditioner
 from grit.diagnostics import step_alerts, summarize_metrics
 from grit.rollout import VLLMRollout, _worker, load_policy_weights
@@ -190,6 +190,49 @@ def test_accumulation_matches_response_mean_with_unequal_lengths():
         for i in range(3):
             yield grpo_loss(model(features[i:i+1]).squeeze(-1), old[i:i+1],
                             advantages[i:i+1], mask[i:i+1])/3
+    accumulate(model, losses)
+    for parameter, expected in zip(model.parameters(), reference):
+        torch.testing.assert_close(parameter.grad, expected)
+
+
+def test_response_microbatch_preserves_global_response_mean_and_alignment():
+    torch.manual_seed(7)
+    prompts = [[1, 2], [3], [4, 5, 6]]
+    responses = [[7, 8], [9], [10, 11, 12]]
+    old = [[-1.0, -2.0], [-3.0], [-4.0, -5.0, -6.0]]
+    advantages = torch.tensor([0.7, -0.2, 0.3])
+
+    class ToyLM(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embedding = nn.Embedding(20, 6)
+            self.head = nn.Linear(6, 20, bias=False)
+
+        def forward(self, input_ids, attention_mask):
+            return SimpleNamespace(logits=self.head(self.embedding(input_ids)))
+
+    model = ToyLM()
+    batch, padded_old = response_microbatch(
+        prompts, responses, old, pad_token_id=0, device="cpu",
+    )
+    values, mask = token_log_probs(model, batch)
+    assert mask.sum(-1).tolist() == [2, 1, 3]
+    assert padded_old[mask].tolist() == pytest.approx([value for row in old for value in row])
+    reference = torch.autograd.grad(
+        grpo_loss(values, padded_old, advantages, mask), tuple(model.parameters()),
+    )
+
+    def losses():
+        for indices in ([0, 1], [2]):
+            part, part_old = response_microbatch(
+                [prompts[index] for index in indices],
+                [responses[index] for index in indices],
+                [old[index] for index in indices],
+                pad_token_id=0, device="cpu",
+            )
+            part_values, part_mask = token_log_probs(model, part)
+            yield grpo_loss(part_values, part_old, advantages[indices], part_mask) * len(indices)/3
+
     accumulate(model, losses)
     for parameter, expected in zip(model.parameters(), reference):
         torch.testing.assert_close(parameter.grad, expected)
@@ -422,6 +465,7 @@ def test_cli_requires_preservation_and_supports_projection_only():
         parse_args(base)
     args = parse_args(base+["--lambda-pres", "0"])
     assert args.generations == 5 and args.task_optimizer == "adamw"
+    assert args.task_microbatch_size == 1 and args.preservation_microbatch_size == 1
     assert args.validation_steps == 2
     assert args.base_statistics_dtype == "float16"
     assert args.projector_relaxation == 0.05
@@ -431,6 +475,8 @@ def test_cli_requires_preservation_and_supports_projection_only():
         parse_args(base+["--lambda-pres", "0", "--validation-steps", "-1"])
     with pytest.raises(SystemExit):
         parse_args(base+["--lambda-pres", "0", "--projector-relaxation", "1.1"])
+    with pytest.raises(SystemExit):
+        parse_args(base+["--lambda-pres", "0", "--task-microbatch-size", "0"])
     with pytest.raises(SystemExit):
         parse_args(base+["--lambda-pres", "0", "--model-revision", "different-pinned-sha"])
 
@@ -458,7 +504,9 @@ def test_small_profile_and_single_gpu_rollout_are_explicit():
 
 def test_small_profile_parameter_counts_match_pinned_architectures():
     from grit.model_profiles import SMALL
-    from transformers import AutoModelForCausalLM, Qwen2Config, Qwen3Config
+    # Resolve lazy imports before meta mode: optional dependencies such as
+    # torchao create real lookup tensors and call .tolist() during import.
+    from transformers import Qwen2Config, Qwen2ForCausalLM, Qwen3Config, Qwen3ForCausalLM
 
     policy = Qwen2Config(vocab_size=151936, hidden_size=896, intermediate_size=4864,
                          num_hidden_layers=24, num_attention_heads=14,
@@ -468,8 +516,8 @@ def test_small_profile_parameter_counts_match_pinned_architectures():
                          num_key_value_heads=8, head_dim=128, tie_word_embeddings=True,
                          attention_bias=False)
     with torch.device("meta"):
-        policy_model = AutoModelForCausalLM.from_config(policy)
-        safety_model = AutoModelForCausalLM.from_config(safety)
+        policy_model = Qwen2ForCausalLM(policy)
+        safety_model = Qwen3ForCausalLM(safety)
     assert sum(p.numel() for p in policy_model.parameters()) == SMALL.policy_parameters
     assert sum(p.numel() for p in safety_model.parameters()) == SMALL.safety_parameters
 
