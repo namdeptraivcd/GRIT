@@ -361,11 +361,19 @@ class Connection:
         pass
 
 
-def test_vllm_worker_requires_sync_and_preserves_tokens(monkeypatch):
+@pytest.mark.parametrize("serialization_setting", [None, "0", "1"])
+def test_vllm_worker_requires_sync_and_preserves_tokens(monkeypatch, serialization_setting):
+    import os
+    import pickle
+
     class Engine:
         def __init__(self, **kwargs):
+            assert os.environ.get("VLLM_ALLOW_INSECURE_SERIALIZATION") == "1"
             assert kwargs["enable_prefix_caching"] is False
         def apply_model(self, function):
+            restored = pickle.loads(pickle.dumps(function))
+            assert restored.func is load_policy_weights
+            assert restored.keywords == {"path": "unused"}
             return [3]
         def generate(self, prompts, sampling, use_tqdm):
             assert prompts == [{"prompt_token_ids": [1, 2]}]
@@ -373,9 +381,12 @@ def test_vllm_worker_requires_sync_and_preserves_tokens(monkeypatch):
             return [SimpleNamespace(outputs=[output])]
     monkeypatch.setitem(sys.modules, "vllm", SimpleNamespace(LLM=Engine, SamplingParams=lambda **kw: kw))
     # Protect test runner environment from worker isolation.
-    import os
     for key in ("CUDA_VISIBLE_DEVICES", "VLLM_WORKER_MULTIPROC_METHOD", "RANK", "WORLD_SIZE"):
         monkeypatch.setenv(key, os.environ.get(key, ""))
+    if serialization_setting is None:
+        monkeypatch.delenv("VLLM_ALLOW_INSECURE_SERIALIZATION", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", serialization_setting)
     conn = Connection([{"op": "sync", "path": "unused", "version": 2},
                        {"op": "generate", "version": 2, "prompts": [[1, 2]], "sampling": {}}, {"op": "close"}])
     _worker(conn, {}, "3")

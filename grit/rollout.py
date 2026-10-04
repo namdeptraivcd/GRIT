@@ -2,6 +2,8 @@
 
 Uses vLLM 0.15.1's public LLM.apply_model API. Weight snapshots are local
 safetensors files, loaded once per policy version before any generation.
+The local rollout worker opts into pickle serialization for trusted GRIT
+callbacks before importing vLLM or spawning its engine processes.
 """
 
 import atexit
@@ -33,6 +35,7 @@ def _worker(connection, config, gpu):
     # Must precede CUDA initialization, including that inside vLLM.
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu)
     os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+    os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
     for key in ("RANK", "WORLD_SIZE", "LOCAL_RANK", "LOCAL_WORLD_SIZE", "MASTER_ADDR", "MASTER_PORT"):
         os.environ.pop(key, None)
     try:

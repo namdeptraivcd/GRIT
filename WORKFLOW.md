@@ -21,6 +21,10 @@ authorized.
   actor weights before every rollout, waits for the matching policy-version
   acknowledgement, and requests generation only with that version. Prefix
   caching is disabled.
+  The rollout subprocess sets `VLLM_ALLOW_INSECURE_SERIALIZATION=1` before
+  importing vLLM so its `LLM.apply_model` weight-loading callback can cross the
+  engine process boundary. Pickle serialization is restricted to this trusted
+  local worker and its children; the actor and notebook environment are unchanged.
 - Actor ranks use replicated weights and manual gradient synchronization. This is
   a single-host NCCL backend, not FSDP, tensor parallelism, or optimizer sharding.
   Projector application rejects a parameter whose last dimension is a local
